@@ -1,0 +1,295 @@
+#=============================================================================================================================================================
+#
+#
+# Fastfile code for Swift / Objective-C project on Github Action
+#
+#
+#=============================================================================================================================================================
+default_platform(:ios)
+
+platform :ios do
+  desc "Push a new beta build to TestFlight"
+  lane :beta do
+    require 'net/http'
+    require 'uri'
+    require 'json'
+    require 'jwt'
+
+    # Get project root path (parent directory of Fastfile)
+    project_root = File.expand_path("..", __dir__)
+    fastlane_path = File.expand_path(".", __dir__)
+
+    KEY_ID = ENV['APP_STORE_CONNECT_KEY_ID'] # From GitHub Actions Secret
+    ISSUER_ID = ENV['APP_STORE_CONNECT_ISSUER_ID'] # From GitHub Actions Secret
+    PRIVATE_KEY_CONTENT = ENV['APP_STORE_CONNECT_PRIVATE_KEY'] # Private key content from environment variable
+    unless KEY_ID && ISSUER_ID && PRIVATE_KEY_CONTENT
+      UI.user_error!("Missing required App Store Connect credentials. Ensure APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_ISSUER_ID, and APP_STORE_CONNECT_PRIVATE_KEY are set as environment variables.")
+    end
+
+    # Automatically find Xcode project (.xcodeproj) or workspace (.xcworkspace) file
+    xcode_file_path = Dir.glob(File.join(project_root, "*.xcworkspace")).first || Dir.glob(File.join(project_root, "*.xcodeproj")).first
+    if xcode_file_path.nil?
+      UI.user_error!("[AppSealing] No Xcode project or workspace found in the project root directory: #{project_root}")
+    end
+
+    # Automatically extract project name and scheme
+    project_name = File.basename(xcode_file_path, File.extname(xcode_file_path)) # Project name without extension
+
+    # Get scheme list
+    scheme_list = []
+    Dir.chdir(File.dirname(xcode_file_path)) do
+      scheme_list_command = "xcodebuild -list -#{xcode_file_path.end_with?('.xcworkspace') ? 'workspace' : 'project'} \"#{File.basename(xcode_file_path)}\""
+      scheme_list_output = sh(scheme_list_command)
+      schemes_section = false
+      scheme_list_output.each_line do |line|
+        line = line.strip
+        if line == "Schemes:"
+          schemes_section = true
+          next
+        end
+        if schemes_section
+          # Schemes section은 빈 줄로 끝남
+          break if line.empty?
+          scheme_list << line
+        end
+      end
+    end
+
+    if scheme_list.empty?
+      UI.user_error!("[AppSealing] No schemes found in the Xcode project or workspace.")
+    end
+
+    def levenshtein_distance(str1, str2)
+      m = str1.length
+      n = str2.length
+      return m if n == 0
+      return n if m == 0
+    
+      d = Array.new(m+1) { Array.new(n+1) }
+    
+      (0..m).each { |i| d[i][0] = i }
+      (0..n).each { |j| d[0][j] = j }
+    
+      (1..m).each do |i|
+        (1..n).each do |j|
+          cost = (str1[i-1] == str2[j-1]) ? 0 : 1
+          d[i][j] = [
+            d[i-1][j] + 1,      # deletion
+            d[i][j-1] + 1,      # insertion
+            d[i-1][j-1] + cost  # substitution
+          ].min
+        end
+      end
+    
+      d[m][n]
+    end
+
+    # Automatically select the scheme most similar to the project name
+    scheme_name = scheme_list.max_by do |scheme|
+      similarity = levenshtein_distance(project_name, scheme)
+      -similarity # Prefer lower distance (higher similarity)
+    end
+
+    UI.message "[AppSealing] Project Name: #{project_name}"
+    UI.message "[AppSealing] Scheme Name: #{scheme_name}"
+
+    # Dynamically extract Bundle ID
+    bundle_id = ""
+    Dir.chdir(File.dirname(xcode_file_path)) do
+      bundle_id_command = "xcodebuild -showBuildSettings -scheme \"#{scheme_name}\" | grep 'PRODUCT_BUNDLE_IDENTIFIER' | awk -F ' = ' '{print $2}'"
+      bundle_id_output = sh(bundle_id_command).lines.map(&:strip).reject { |line| line.include?("WARNING") || line.empty? }
+      bundle_id = bundle_id_output.last.strip
+    end
+
+    if bundle_id.empty?
+      UI.user_error!("[AppSealing] Failed to retrieve Bundle ID from Xcode project.")
+    end
+
+    UI.message "[AppSealing] Bundle ID: #{bundle_id}"
+
+    # Dynamically extract Team ID
+    team_id = ""
+    Dir.chdir(File.dirname(xcode_file_path)) do
+      team_id_command = "xcodebuild -showBuildSettings -scheme #{scheme_name} | grep 'DEVELOPMENT_TEAM' | awk -F ' = ' '{print $2}'"
+      team_id_output = sh(team_id_command).lines.map(&:strip).reject { |line| line.include?("WARNING") || line.empty? }
+      team_id = team_id_output.last.strip
+    end
+
+    if team_id.empty?
+      UI.user_error!("[AppSealing] Failed to retrieve Team ID from Xcode project.")
+    end
+
+    UI.message "[AppSealing] Team ID: #{team_id}"
+
+    # Function to generate JWT token
+    def generate_jwt_token(private_key_content)
+      private_key = OpenSSL::PKey::EC.new(private_key_content)      
+      payload = {
+        iss: ISSUER_ID,
+        exp: Time.now.to_i + 20 * 60, # 20 minutes validity
+        aud: "appstoreconnect-v1"
+      }
+      header = { kid: KEY_ID }
+      JWT.encode(payload, private_key, 'ES256', header)
+    end    
+
+    # Function to fetch CFBundleShortVersionString (MARKETING_VERSION) from Xcode project
+    def fetch_version_from_xcode(xcodeproj_path, scheme_name)
+      version_command = "xcodebuild -project \"#{xcodeproj_path}\" -scheme \"#{scheme_name}\" -showBuildSettings | grep MARKETING_VERSION | sed 's/[ ]*MARKETING_VERSION = //'"
+      version = `#{version_command}`.strip
+      if version.empty?
+        UI.user_error!("Failed to retrieve MARKETING_VERSION from Xcode project.")
+      end
+      UI.message("[AppSealing] Retrieved MARKETING_VERSION: #{version}")
+      version
+    end
+    
+    # Function to fetch the latest build number
+    def fetch_latest_build_number(jwt_token, bundle_id, version)
+      # Fetch App ID if needed
+      app_id = fetch_app_id(jwt_token, bundle_id)
+
+      # API request URL
+      uri = URI("https://api.appstoreconnect.apple.com/v1/builds?filter[app]=#{app_id}&filter[preReleaseVersion.version]=#{version}&sort=-version")
+      request = Net::HTTP::Get.new(uri)
+      request['Authorization'] = "Bearer #{jwt_token}"
+
+      # Execute API request
+      response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
+        http.request(request)
+      end
+
+      # Handle response
+      if response.code.to_i == 200
+        builds = JSON.parse(response.body)['data']
+        if builds && !builds.empty?
+          latest_build_number = builds.first['attributes']['version'].to_i
+          return latest_build_number
+        else
+          UI.message("[AppSealing] No builds found for version #{version}.")
+        end
+      else
+        UI.error("[AppSealing] Failed to fetch builds: #{response.code} - #{response.body}")
+      end
+
+      nil # Return nil if no build found
+    end
+
+    # Function to fetch App ID (if needed)
+    def fetch_app_id(jwt_token, bundle_id)
+      uri = URI("https://api.appstoreconnect.apple.com/v1/apps?filter[bundleId]=#{bundle_id}")
+      request = Net::HTTP::Get.new(uri)
+      request['Authorization'] = "Bearer #{jwt_token}"
+
+      response = Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
+        http.request(request)
+      end
+
+      if response.code.to_i == 200
+        apps = JSON.parse(response.body)['data']
+        if apps && !apps.empty?
+          app_id = apps.first['id']
+          return app_id
+        else
+          UI.user_error!("[AppSealing] No app found with bundle ID: #{bundle_id}")
+        end
+      else
+        UI.error("[AppSealing] Failed to fetch app ID: #{response.code} - #{response.body}")
+        UI.user_error!("[AppSealing] Unable to retrieve app ID for bundle ID: #{bundle_id}")
+      end
+
+      nil # Return nil if no app ID found
+    end
+
+    # Generate JWT token and fetch latest build number
+    jwt_token = generate_jwt_token(PRIVATE_KEY_CONTENT)
+    version = fetch_version_from_xcode(xcode_file_path, scheme_name)
+    latest_build_number = fetch_latest_build_number(jwt_token, bundle_id, version)
+
+    if latest_build_number.nil?
+      UI.message("[AppSealing] No builds found for version #{version}. Starting with build number 1.")
+      new_build_number = 1
+    else
+      new_build_number = latest_build_number + 1
+      UI.message("[AppSealing] Latest Build Number: #{latest_build_number}")
+    end
+
+    # Set new build number (apply to Xcode project)
+    increment_build_number(
+      build_number: new_build_number,
+      xcodeproj: xcode_file_path # Specify Xcode project path
+    )
+
+    UI.message "[AppSealing] Updated Build Number: #{new_build_number}"
+
+    # Build and generate IPA file
+    archive_path = File.join(project_root, "build", "#{project_name}.xcarchive")
+    ipa_output_path = File.join(project_root, "build")
+
+    build_ios_app(
+      scheme: scheme_name,
+      export_method: "app-store",
+      clean: true,
+      output_directory: ipa_output_path,
+      output_name: "#{project_name}.ipa",
+      workspace: xcode_file_path.end_with?(".xcworkspace") ? xcode_file_path : nil,
+      project: xcode_file_path.end_with?(".xcodeproj") ? xcode_file_path : nil,
+      export_options: {
+        provisioningProfiles: {
+          bundle_id => ENV["PROFILE"]
+        }
+      },
+      xcargs: "CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM=#{team_id} PROVISIONING_PROFILE_SPECIFIER=\"#{ENV['PROFILE']}\"",
+      codesigning_identity: "Apple Distribution"
+    )
+
+    # Set .ipa file path
+    ipa_path = File.join(ipa_output_path, "#{project_name}.ipa")
+
+    unless File.exist?(ipa_path)
+      UI.user_error!("[AppSealing] IPA file not found at path: #{ipa_path}")
+    end
+
+    UI.message "[AppSealing] IPA Path: #{ipa_path}"
+
+    # Dynamically search for generate_hash script
+    generate_hash_script = File.join(project_root, "AppSealingSDK", "Tools", "generate_hash")
+    unless File.exist?(generate_hash_script)
+      UI.user_error!("[AppSealing] generate_hash script not found at path: #{generate_hash_script}")
+    end
+    
+    # Check and set executable permission
+    unless File.executable?(generate_hash_script)
+      sh("chmod +x '#{generate_hash_script}'")
+    end    
+    sh("'#{generate_hash_script}' '#{File.absolute_path(ipa_path)}'")
+
+    # Step 2: Upload the IPA to TestFlight with callback
+    begin
+      upload_to_testflight(
+        ipa: ipa_path,
+        api_key: {
+          key_id: KEY_ID,
+          issuer_id: ISSUER_ID,
+          key: PRIVATE_KEY_CONTENT
+        },
+        skip_waiting_for_build_processing: true, # Skip waiting for build processing
+      )      
+      UI.success("[AppSealing] Upload to TestFlight completed successfully!")
+      
+    rescue => e
+      UI.error("[AppSealing] Upload to TestFlight failed with error: #{e.message}")
+      raise e
+      
+    ensure
+      # Always delete the build directory, even if an error occurs
+      if Dir.exist?(ipa_output_path)
+        UI.message("[AppSealing] Deleting build directory: #{ipa_output_path}")
+        FileUtils.rm_rf(ipa_output_path)
+        UI.message("[AppSealing] Build directory deleted.")
+      else
+        UI.message("[AppSealing] Build directory not found or already deleted.")
+      end
+    end
+  end
+end

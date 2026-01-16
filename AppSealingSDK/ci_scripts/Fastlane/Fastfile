@@ -1,0 +1,189 @@
+#=============================================================================================================================================================
+#
+#
+# Fastfile code for Swift / Objective-C / Flutter / Cordova / Ionic / React-native project
+#
+#
+#=============================================================================================================================================================
+default_platform(:ios)
+
+before_all do
+  ENV["FASTLANE_USER"] = "<Your apple ID>"	# Change this value to your apple account ID
+  ENV["FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD"] = "<Your apple app-specific-password>" # Change this value to your apple account password
+  ENV['PROFILE'] = "<Your provisioning profile name for distribution>"	# Change this value to your provisioning profile name
+end
+
+platform :ios do
+  desc "Push a new beta build to TestFlight"
+  lane :beta do
+    # Get the project root path
+    project_root = File.expand_path("..", __dir__)
+
+    # Dynamically search for Xcode project or workspace file
+    xcode_file_path = Dir.glob(File.join(project_root, "*.xcworkspace")).first || Dir.glob(File.join(project_root, "*.xcodeproj")).first
+    if xcode_file_path.nil?
+      UI.user_error!("[AppSealing] No Xcode project or workspace found in the project root directory: #{project_root}")
+    end
+
+    # Automatically extract project name and scheme
+    project_name = File.basename(xcode_file_path, File.extname(xcode_file_path)) # Project name without extension
+
+    # Get scheme list
+    scheme_list = []
+    scheme_list_started = false
+    Dir.chdir(File.dirname(xcode_file_path)) do
+      scheme_list_command = "xcodebuild -list -#{xcode_file_path.end_with?('.xcworkspace') ? 'workspace' : 'project'} #{File.basename(xcode_file_path)}"
+      scheme_list_output = sh(scheme_list_command).lines.map(&:strip).reject { |line| line.empty? }
+      scheme_list_output.each do |line|
+        if line.start_with?("Schemes:")
+          scheme_list_started = true
+          next
+        elsif scheme_list_started and (line.start_with?("Targets:") or line.start_with?("Build Configurations:"))
+          break
+        elsif scheme_list_started
+          scheme_list << line
+        end
+      end
+    end
+
+    if scheme_list.empty?
+      UI.user_error!("[AppSealing] No schemes found in the Xcode project or workspace.")
+    end
+
+    # Automatically select the scheme most similar to the project name
+    scheme_name = scheme_list.max_by do |scheme|
+      similarity = levenshtein_distance(project_name, scheme)
+      -similarity # Prefer lower distance (higher similarity)
+    end
+
+    # Dynamically extract Bundle ID
+    bundle_id = ""
+    Dir.chdir(File.dirname(xcode_file_path)) do
+      bundle_id_command = "xcodebuild -showBuildSettings -scheme #{scheme_name} | grep 'PRODUCT_BUNDLE_IDENTIFIER' | awk -F ' = ' '{print $2}'"
+      bundle_id_output = sh(bundle_id_command).lines.map(&:strip).reject { |line| line.include?("WARNING") || line.empty? }
+      bundle_id = bundle_id_output.last.strip
+    end
+
+    if bundle_id.empty?
+      UI.user_error!("[AppSealing] Failed to retrieve Bundle ID from Xcode project.")
+    end
+
+    # Dynamically extract Team ID
+    team_id = ""
+    Dir.chdir(File.dirname(xcode_file_path)) do
+      team_id_command = "xcodebuild -showBuildSettings -scheme #{scheme_name} | grep 'DEVELOPMENT_TEAM' | awk -F ' = ' '{print $2}'"
+      team_id_output = sh(team_id_command).lines.map(&:strip).reject { |line| line.include?("WARNING") || line.empty? }
+      team_id = team_id_output.last.strip
+    end
+
+    if team_id.empty?
+      UI.user_error!("[AppSealing] Failed to retrieve Team ID from Xcode project.")
+    end
+
+    UI.message "[AppSealing] Project Name: #{project_name}"
+    UI.message "[AppSealing] Scheme Name: #{scheme_name}"
+    UI.message "[AppSealing] Bundle ID: #{bundle_id}"
+    UI.message "[AppSealing] Team ID: #{team_id}"
+
+    # Build and generate IPA file
+    archive_path = File.join(project_root, "build", "#{project_name}.xcarchive")
+    ipa_output_path = File.join(project_root, "build")
+
+    # Separate workspace and project options for build_ios_app
+    build_options = {
+      scheme: scheme_name,
+      export_method: "app-store",
+      clean: true,
+      output_directory: ipa_output_path,
+      output_name: "#{project_name}.ipa",
+      export_options: {
+        provisioningProfiles: {
+          bundle_id => ENV["PROFILE"]
+        }
+      }
+    }
+
+    if xcode_file_path.end_with?(".xcworkspace")
+      build_options[:workspace] = xcode_file_path
+      build_options[:project] = nil
+    else
+      build_options[:project] = xcode_file_path
+      build_options[:workspace] = nil
+    end
+
+    build_ios_app(build_options)
+
+    # Set .ipa file path
+    ipa_path = File.join(ipa_output_path, "#{project_name}.ipa")
+
+    unless File.exist?(ipa_path)
+      UI.user_error!("[AppSealing] IPA file not found at path: #{ipa_path}")
+    end
+
+    UI.message "[AppSealing] IPA Path: #{ipa_path}"
+
+    # Dynamically search and execute generate_hash script
+    generate_hash_script = Dir.glob(File.join(project_root, "**/generate_hash")).first
+
+    if generate_hash_script.nil?
+      if File.exist?(File.join(project_root, "AppSealingSDK", "Tools", "generate_hash"))
+        # Path for general projects
+        generate_hash_script = File.join(project_root, "AppSealingSDK", "Tools", "generate_hash")
+      else
+        # Path for React Native projects
+        generate_hash_script = File.join(project_root, "AppSealingSDK", "generate_hash")
+      end
+    end
+      
+    unless File.exist?(generate_hash_script)
+      UI.user_error!("[AppSealing] generate_hash script not found at path: #{generate_hash_script}")
+    end
+    
+    unless File.executable?(generate_hash_script)
+      sh("chmod +x '#{generate_hash_script}'")
+    end
+    
+    sh("#{generate_hash_script} #{File.absolute_path(ipa_path)}")
+
+    # Step 2: Upload the IPA to TestFlight with callback
+    begin
+      upload_to_testflight(
+        ipa: ipa_path,
+        skip_waiting_for_build_processing: true, # Skip waiting for build processing
+      )      
+      UI.success("[AppSealing] Upload to TestFlight completed successfully!")
+      
+    rescue => e
+      UI.error("[AppSealing] Upload to TestFlight failed with error: #{e.message}")
+      raise e
+      
+    ensure
+      # Always delete the build directory, even if an error occurs
+      if Dir.exist?(ipa_output_path)
+        UI.message("[AppSealing] Deleting build directory: #{ipa_output_path}")
+        FileUtils.rm_rf(ipa_output_path)
+        UI.message("[AppSealing] Build directory deleted.")
+      else
+        UI.message("[AppSealing] Build directory not found or already deleted.")
+      end
+    end
+  end
+end
+
+def levenshtein_distance(str1, str2)
+  m = str1.length + 1
+  n = str2.length + 1
+  d = Array.new(m) { Array.new(n, 0) }
+
+  (1...m).each { |i| d[i][0] = i }
+  (1...n).each { |j| d[0][j] = j }
+
+  (1...m).each do |i|
+    (1...n).each do |j|
+      cost = str1[i - 1] == str2[j - 1] ? 0 : 1
+      d[i][j] = [d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost].min
+    end
+  end
+
+  d[m - 1][n - 1]
+end

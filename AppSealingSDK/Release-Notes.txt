@@ -1,0 +1,177 @@
+==========================================
+	AppSealing SDK Release Notes
+==========================================
+
+Version 1.12.0.0 (January 28th, 2026)
+	- Support Secure UserDefaults : all values in UserDefaults are strongly protected (optional)
+	- Support Secure Filesystem : all user file contents are strongly protected (optional)
+	- Support React Native 0.79.x, 0.80.x, 0.81.x, 0.82.x, 0.83.x
+	- Fixed generate_hash ssl error
+	- Improved interface API to fix occasional crash
+
+Version 1.11.6.0 (November 12th, 2025)
+    - (Unity) Rollbacked Unity script to pre-1.11 version singleton behavior.
+	- (Unity) Commented out credential code from the template code due to it causing the game to freeze when the device of iOS 26 is offline.
+	  These two breaking changes in Unity script require you to update Check_iOS_Security.cs for this release.
+	- (Xcode) Added easy integration script for native projects to be integrated easily.
+	  Give execution permission (chmod +x AppSealingSDK/Tools/install.sh) and run AppSealingSDK/Tools/install.sh to automatically integrate the SDK.
+	  After applying, you can also use AppSealingSDK/Tools/ApplySealing.sh to build a Transporter-ready IPA. (ApplySealing.sh is EXPERIMENTAL)
+
+Version 1.11.2.0 (June 20, 2025)
+	- Fixed an error where an incorrect Credential value is returned after the second call to GetEncryptedCredentialAsync
+	- Fixed a project path to be searched first in the source code search path when using String Encryption
+	- Fixed a ruby ​​environment encoding to be forcibly set to UTF-8 when using String Encryption
+	- Fixed a symptom where constant values ​​defined in AppsealingiOS.h caused duplicate definition errors
+	- Changed the AppsealingiOS.mm and LEASection.mm files to be restored after compilation when using String Encryption
+	- Changed the generate_hash script to treat it as an error and terminate the task if an absolute path is not used for the IPA path parameter.
+	- Changed the generate_hash script to treat it as an error and terminate the task if it encounters an ambiguity issue where more than two signing certificates are found.
+	- Changed Unreal Plugin sample code to call Unreal_GetEncryptedCredential and Unreal_IsAbnormalEnvironmentDetected functions asynchronously.
+
+Version 1.11.0.0 (June 2nd, 2025)
+    - Support Xcode Framework
+	- Support ARM64 Simulator (only for Xcode Framework)
+	- Fix some crashes within anti-swizzling routine due to dynamically removed methods
+	- Improved app launching delay
+	- Support Azure, Bitrise, Circle CI integration
+	- Support automatic hermes manipulation & verfication
+	- Fixed certificate re-signed false positive error
+
+Version 1.10.1.0 (March 12, 2025)
+	- Support React Native 0.77.x, 0.78.0
+
+Version 1.10.0.0 (January 31, 2025)
+	- Support Fastlane script for Xcode, Flutter, Unity3D, Cordova, Ionic, React Native project
+	- Support React Native 0.74.3, 0.75.x, 0.76.x
+	- Improved generate_hash to remove App Store Connect upload error after re-signing
+	- Fixed occasional Unity3D app crash due to anti-hooking logic
+	- Deprecated support for Xamarin project
+	- Deprecated support for React Native 0.64.x ~ 0.70.x
+
+Version 1.9.0.0 (June 3, 2024)
+	- Support anti-swizzling, anti-hooking and enhanced jailbreak detection
+	- Support Xcode Cloud integration
+	- Support React Native 0.74.x
+
+Version 1.8.0.0 (April 3, 2024)
+	- Support distribution without App Store & TestFlight when "AdhocEnabled" SDK is used
+	- Manual authorization step for “generate_genesis” when applying AppSelaing SDK has removed
+
+Version 1.7.0.0 (December 25, 2023)
+	- Support String Encryption for Swift / Objecti27ve-C
+	- Fix upload error of Xamarin app with capability
+
+Version 1.6.0.0 (October 19, 2023)
+	- Support React Native 0.72.x
+	- Improved internal cryptography robustness 
+	- Added automatic internal API call to prevent app termination
+	- Fixed certificate parsing error
+	- Fixed app termination in unstable network connection
+	- Fixed App Store Connect upload error
+
+Version 1.5.3.0.c (September 12, 2023)
+	- Support React-Native 0.72.x
+	- Fix certificate parsing error
+
+Version 1.5.2.0 (July 23, 2023)
+	- Fix Apple store certificate information
+
+Version 1.5.0.0 (July 13, 2023)
+	- Improved code stablity for sqlite3_free_table crash log
+	- Support React Native 0.71.x
+	- Support dynamic whitelist for Assets.car file in app package
+	- Support dynamic update for App Store certificate verification template
+
+Version 1.4.0.0 (January 11, 2023)
+	- Support Xamarin via Visual Studio for MAC
+	- Support React Native 0.67.x / 0.68.x / 0.69.x / 0.70.x
+	- Improved jailbreak detection by server-side credential verfication
+	- Improved code stablity for crash rate reduction
+
+Version 1.3.4.0 (November 15, 2022)
+	- Fixed generate_hash script corrupting integrity
+
+Version 1.3.3.0 (November 3, 2022)
+	- Support Microsoft Authentication Library
+
+Version 1.3.2.0 (October 19, 2022)
+	- Support enterprise distribution for HDFC
+
+Version 1.3.1.0 (September 21, 2022)
+	- Fixed team ID verfication false-positive failure
+	- Fixed Xcode link error for simulator
+
+Version 1.3.0.0 (August 22, 2022)
+	- Improved OpenSSL, BoringSSL, GRPC library compatibility
+	- Fixed generate_hash script freezing phenomenon
+
+Version 1.2.1.0 (May 10, 2022)
+	- Fixed jailbreak detection false positive error in iOS 15
+
+Version 1.2.0.0 (April 06, 2022)
+	- Improved Jailbreak detection
+          Improved the detection of the bypassed jailbreak environment by using bypass tools such as A-Bypass in 64bit OS environment.
+	- Improved malicious dynamic inject detection
+          Improved to detect malicious tools that can be used for reverse engineering of the app.
+	  e.g.) MobileSubstrate, CydiaSubstrate, frida, cycript, SSLKillSwitch
+	- Fixed app integrity check failure when the app includes file with name containing comma.
+
+Version 1.1.7.0 (December 21, 2021)
+	- Support Flutter app
+	- Fixed app integrity check failure when very large number of files included in app
+
+Version 1.1.6.0 (October 18, 2021)
+	- Fixed app integrity check failure when Plugins/ items included
+
+Version 1.1.5.1 (August 26, 2021)
+	- Fixed sudden app termination in about 20 seconds after launching the app
+	  in case an app is newly distributed or updated in the Apple Store after June 21, 2021.
+
+Version 1.1.5.0 (July 5, 2021)
+    - Support using 3rd-party library built with Boring-SSL (e.g. GRPC library)
+	    Fixed runtime crash when running the app which includes Boring-SSL or Boring-SSL based library.
+		Crash at unity app with GRPC asset has also fixed.
+
+Version 1.1.4.0 (May 11, 2021)
+    - Improved Stability
+        Improvements have been made in areas where a crash can occur in the process of automatically closing an app when a security threat is detected.
+
+Version 1.1.3.0 (January 5, 2021)
+	- Re-signing Script error fixed
+        Fixed ITMS-90035 error when uploading re-signed IPA to App Store Connect and script error with empty "Associated Domains" capability enabled IPA.
+
+Version 1.1.3.0 (January 5, 2021)
+	- Re-signing Script error fixed
+        Fixed ITMS-90035 error when uploading re-signed IPA to App Store Connect and script error with empty "Associated Domains" capability enabled IPA.
+
+Version 1.1.2.0 (December 15, 2020)
+	- Re-signing Script error fixed
+		Fixed ITMS-90046 error when uploading re-signed IPA to App Store Connect with "Associated Domains" capability enabled IPA.
+		Fixed script error when re-signing an IPA which has project name with space.
+
+Version 1.1.1.0 (December 10, 2020)
+	- Fixed error on SDK libraries
+		"Invalid bitcode version" link error occurs in Xcode 11.7 or lower version.
+
+Version 1.1.0.0 (November 25, 2020)
+	- Add feature 'Improved Integrity check'
+	- Add feature 'Re-signing detection'
+	- Add feature 'Support Unreal Engine plugin'
+
+
+Version 1.0.11.0 (May.12.2020)
+	- Support Unity 2020
+		iOS AppSealing 1.0.11.0 version supports Unity Engine 2020 version.
+		AppSealing is constantly updating to support Unity's latest engine versions. 
+
+	- Fixed error on SDK documents
+		SDK guide document updated to resolve an error that integrity verification function 
+		is not applied if copy and paste the script of the SDK document. 
+ 
+
+Version 1.0.0 (April 5, 2019)
+	- Add feature 'Jailbreak detection'
+	- Add feature 'Anti-debugging'
+	- Add feature 'Not encrypted executable file detection'
+	- Add feature 'integrity check'
+
+

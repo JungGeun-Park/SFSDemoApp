@@ -1,0 +1,8 @@
+README.md
+setup.py
+openstep_parser/__init__.py
+openstep_parser/openstep_parser.py
+openstep_parser.egg-info/PKG-INFO
+openstep_parser.egg-info/SOURCES.txt
+openstep_parser.egg-info/dependency_links.txt
+openstep_parser.egg-info/top_level.txt

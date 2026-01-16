@@ -1,0 +1,175 @@
+#=============================================================================================================================================================
+#
+#
+# Azure Script code for Swift / Objective-C project
+#
+#
+#=============================================================================================================================================================
+trigger:
+- develop   # Change to your branch name
+
+pool:
+  name: APPSEALING  # Change to your agent name
+
+steps:
+- script: |
+    # Define paths
+    P12_CERT_PATH="$(Build.SourcesDirectory)/distribution.p12"
+    PROVISIONING_PROFILE_PATH="$(Build.SourcesDirectory)/profile.mobileprovision"
+    KEYCHAIN_PATH="$HOME/Library/Keychains/temp-keychain.keychain-db"
+    KEYCHAIN_PASSWORD="temp123"
+
+    if security list-keychains | grep -q "temp-keychain.keychain-db"; then
+        echo "Deleting existing temporary keychain..."
+        security delete-keychain "$KEYCHAIN_PATH"
+    fi
+
+    echo "Creating temporary keychain..."
+    security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+    echo "Setting temporary keychain as default..."
+    security list-keychains -d user -s "$KEYCHAIN_PATH"
+    security default-keychain -s "$KEYCHAIN_PATH"
+    security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+    security set-keychain-settings -lut 3600 "$KEYCHAIN_PATH"
+
+    echo "Importing distribution certificate (PKCS#12) into temporary keychain..."
+    security import "$P12_CERT_PATH" -k "$KEYCHAIN_PATH" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+    security find-identity -v "$KEYCHAIN_PATH"
+  displayName: 'Setup Temporary Keychain and Install Certificate'
+  env:
+    CERTIFICATE_PASSWORD: $(CERTIFICATE_PASSWORD)
+
+- script: |
+    SCHEME_NAME=$(xcodebuild -list -json | (python -c 'import sys, json; print(json.load(sys.stdin)["project"]["schemes"][0])' || python3 -c 'import sys, json; print(json.load(sys.stdin)["project"]["schemes"][0])'))
+    APP_NAME=$(xcodebuild -list -json | (python -c 'import sys, json; print(json.load(sys.stdin)["project"]["targets"][0])' || python3 -c 'import sys, json; print(json.load(sys.stdin)["project"]["targets"][0])'))
+    echo "##vso[task.setvariable variable=SCHEME_NAME]$SCHEME_NAME"
+    echo "##vso[task.setvariable variable=APP_NAME]$APP_NAME"
+    echo "##[debug] Extracted SCHEME_NAME: $SCHEME_NAME"
+    echo "##[debug] Extracted APP_NAME: $APP_NAME"
+  displayName: 'Extract Scheme and App Name'
+
+- script: |
+    # Automatically increment build number
+    cd "/Users/puzznic/Project/Azure_Agent/_work/2/s/$(APP_NAME).xcodeproj"
+    agvtool next-version -all
+    NEW_BUILD_NUMBER=$(agvtool what-version -terse)
+    echo "##vso[task.setvariable variable=BUILD_NUMBER]$NEW_BUILD_NUMBER"
+    echo "##[debug] New Build Number: $NEW_BUILD_NUMBER"
+  displayName: 'Increment Build Number'
+
+- script: |
+    INFO_PLIST_PATH="${BUILD_SOURCESDIRECTORY}/${APP_NAME}/Info.plist"
+    BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$INFO_PLIST_PATH" 2>/dev/null)
+
+    # If not found in Info.plist, use xcodebuild to extract it
+    if [[ -z "$BUNDLE_ID" ]]; then
+        echo "CFBundleIdentifier not found in Info.plist. Trying to extract it using xcodebuild..."
+        BUNDLE_ID=$(xcodebuild -showBuildSettings -project "${BUILD_SOURCESDIRECTORY}/Azure_Swift.xcodeproj" -scheme "${SCHEME_NAME}" | grep -E '^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER[[:space:]]*=' | sed 's/.*= //')
+    fi
+
+    # Ensure BUNDLE_ID is not empty
+    if [[ -z "$BUNDLE_ID" ]]; then
+        echo "Error: Bundle identifier not found."
+        exit 1
+    fi
+
+    echo "Final BUNDLE_ID: $BUNDLE_ID"
+    echo "##vso[task.setvariable variable=BUNDLE_ID]$BUNDLE_ID"
+    echo "##[debug]Extracted Bundle ID: $BUNDLE_ID"
+
+    # Create ExportOptions.plist after extracting the Bundle ID
+    EXPORT_DIR="$HOME/exports"
+    mkdir -p "$EXPORT_DIR"
+    cat << EOF > "$EXPORT_DIR/ExportOptions.plist"
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+        <key>method</key>
+        <string>app-store</string>
+        <key>teamID</key>
+        <string>$TEAM_ID</string>
+        <key>provisioningProfiles</key>
+        <dict>
+            <key>$BUNDLE_ID</key>
+            <string>$PROVISIONING_PROFILE_NAME</string>
+        </dict>
+    </dict>
+    </plist>
+    EOF
+
+    echo "ExportOptions.plist created with provisioningProfiles and bundle ID."
+    cat "$EXPORT_DIR/ExportOptions.plist"  # Output the created plist content for debugging
+  displayName: 'Extract Bundle ID and Create ExportOptions.plist'
+  env:
+    TEAM_ID: $(TEAM_ID)
+    PROVISIONING_PROFILE_NAME: $(PROVISIONING_PROFILE_NAME)
+
+- script: |
+    # Define paths
+    EXPORT_DIR="$(Build.ArtifactStagingDirectory)"
+    IPA_PATH="$EXPORT_DIR/$(APP_NAME).ipa"
+    ARCHIVE_PATH="$EXPORT_DIR/$(APP_NAME).xcarchive"
+    WORKSPACE_PATH="$(Build.SourcesDirectory)/$(APP_NAME).xcodeproj/project.xcworkspace"
+
+    echo "Updating Deployment Target to 12.0..."
+    /usr/libexec/PlistBuddy -c "Set :IPHONEOS_DEPLOYMENT_TARGET 12.0" "$(Build.SourcesDirectory)/$(APP_NAME)/Info.plist"
+
+    echo "Starting Xcode Archive..."
+    xcodebuild -workspace "$WORKSPACE_PATH" \
+               -scheme '$(SCHEME_NAME)' \
+               -sdk iphoneos \
+               -configuration 'Release' \
+               clean archive \
+               CODE_SIGN_IDENTITY="iPhone Distribution" \
+               CODE_SIGN_STYLE="Manual" \
+               DEVELOPMENT_TEAM="$TEAM_ID" \
+               PROVISIONING_PROFILE_SPECIFIER="$PROVISIONING_PROFILE_NAME" \
+               -archivePath "$ARCHIVE_PATH"
+
+    echo "Exporting IPA..."
+    xcodebuild -exportArchive \
+      -archivePath "$ARCHIVE_PATH" \
+      -exportOptionsPlist "$HOME/exports/ExportOptions.plist" \
+      -exportPath "$EXPORT_DIR"
+
+    echo "IPA successfully exported: $IPA_PATH"
+  displayName: 'Build and Export IPA'
+  env:
+    TEAM_ID: $(TEAM_ID)
+    PROVISIONING_PROFILE_NAME: $(PROVISIONING_PROFILE_NAME)
+
+- script: |
+    # Grant execution permission to generate_hash script
+    HASH_SCRIPT_PATH="$(Build.SourcesDirectory)/AppSealingSDK/Tools/generate_hash"
+    IPA_PATH="$(Build.ArtifactStagingDirectory)/$(APP_NAME).ipa"
+
+    echo "Granting execution permission to generate_hash..."
+    chmod +x "$HASH_SCRIPT_PATH"
+
+    echo "Running generate_hash with IPA..."
+    "$HASH_SCRIPT_PATH" "$IPA_PATH"
+
+    echo "Hash generation completed."
+  displayName: 'Run generate_hash on IPA'
+
+- script: |
+    xcrun altool --upload-app -f "$(Build.ArtifactStagingDirectory)/$(APP_NAME).ipa" -t ios -u "$APPLE_ID" -p "$APP_SPECIFIC_PASSWORD"
+  displayName: 'Upload to TestFlight'
+  env:
+    APPLE_ID: $(APPLE_ID)
+    APP_SPECIFIC_PASSWORD: $(APP_SPECIFIC_PASSWORD)
+
+- script: |
+    echo "Deleting temporary keychain..."
+    TEMP_KEYCHAIN_PATH="$HOME/Library/Keychains/temp-keychain.keychain-db"
+    if [ -f "$TEMP_KEYCHAIN_PATH" ]; then
+        # Delete only the temporary keychain, not the default login keychain
+        security delete-keychain "$TEMP_KEYCHAIN_PATH"
+        echo "Temporary keychain deleted successfully."
+    else
+        echo "Temporary keychain not found. Skipping deletion."
+    fi
+  displayName: 'Cleanup Temporary Keychain'

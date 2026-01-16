@@ -1,0 +1,151 @@
+---
+format_version: '13'
+default_step_lib_source: https://github.com/bitrise-io/bitrise-steplib.git
+project_type: flutter
+workflows:
+  deploy:
+    steps:
+    - git-clone@8: {}
+    - script@1:
+        title: Create Keychain
+        inputs:
+          - content: |-
+              #!/bin/bash
+              set -ex
+              security delete-keychain login.keychain-db
+              security create-keychain -p "$BITRISE_KEYCHAIN_PASSWORD" login.keychain-db
+              security default-keychain -s login.keychain-db
+              security unlock-keychain -p "$BITRISE_KEYCHAIN_PASSWORD" login.keychain-db
+              security set-keychain-settings -t 3600 -l login.keychain-db
+    - certificate-and-profile-installer@1:
+        inputs:
+          - certificate_url: "file://./ios/distribution.p12"
+          - certificate_passphrase: "$CERTIFICATE_PASSWORD"
+          - provisioning_profile_url: "file://./ios/profile.mobileprovision"
+          - keychain_path: "$HOME/Library/Keychains/login.keychain-db"
+          - keychain_password: "$BITRISE_KEYCHAIN_PASSWORD"
+    - flutter-installer@0:
+        inputs:
+        - version: 3.29.0
+        - is_update: 'false'
+    - script@1:
+        title: Set Project Path and Scheme
+        inputs:
+          - content: |-
+              #!/bin/bash
+              set -ex
+              
+              # Find iOS project path
+              PROJECT_PATH=$(find . -path "*/ios/*.xcodeproj" -type d | head -n 1)
+              if [ -z "$PROJECT_PATH" ]; then
+                echo "Error: No iOS Xcode project found"
+                exit 1
+              fi
+              
+              # Find scheme
+              SCHEME=$(xcodebuild -project "$PROJECT_PATH" -list | grep -A 1 "Schemes:" | tail -n 1 | xargs)
+              if [ -z "$SCHEME" ]; then
+                echo "Error: No scheme found"
+                exit 1
+              fi
+              
+              # Set environment variables
+              envman add --key BITRISE_PROJECT_PATH --value "$PROJECT_PATH"
+              envman add --key BITRISE_SCHEME --value "$SCHEME"
+              
+              echo "iOS Project Path: $PROJECT_PATH"
+              echo "Scheme: $SCHEME"
+    - script@1:
+        title: Flutter Setup
+        inputs:
+          - content: |-
+              #!/bin/bash
+              set -ex
+              cd $BITRISE_FLUTTER_PROJECT_LOCATION
+              flutter clean
+              flutter pub get
+    - script@1:
+        title: Update Build Number
+        inputs:
+          - content: |-
+              #!/bin/bash
+              set -ex
+              cd $BITRISE_SOURCE_DIR/ios
+              # Update iOS build number
+              agvtool new-version -all $BITRISE_BUILD_NUMBER
+              # Update Flutter build number (pubspec.yaml)
+              cd ..
+              VERSION=$(grep 'version:' pubspec.yaml | awk '{print $2}' | cut -d'+' -f1)
+              sed -i '' "s/^version: .*$/version: $VERSION+$BITRISE_BUILD_NUMBER/" pubspec.yaml              
+    - flutter-build@0:
+        inputs:
+          - project_location: "$BITRISE_FLUTTER_PROJECT_LOCATION"
+          - platform: ios
+          - ios_output_type: archive        # Use 'archive' instead of 'ipa'
+          - distribution_method: app-store
+          - automatic_code_signing: api-key
+          - ios_additional_params: --release
+          - ios_output_pattern: |-
+              *build/ios/iphoneos/*.app
+              *build/ios/archive/*.xcarchive
+          - cache_level: all
+    - xcode-archive@5:
+        inputs:
+          - project_path: "$BITRISE_PROJECT_PATH"
+          - scheme: "$BITRISE_SCHEME"
+          - distribution_method: app-store
+          - automatic_code_signing: api-key
+          - cache_level: none
+          - certificate_url_list: "file://./ios/distribution.p12"
+          - passphrase_list: "$CERTIFICATE_PASSWORD"
+          - keychain_path: "$HOME/Library/Keychains/login.keychain-db"
+          - keychain_password: "$BITRISE_KEYCHAIN_PASSWORD"
+    - script@1:
+        title: Set IPA Path
+        inputs:
+          - content: |-
+              #!/bin/bash
+              set -ex
+              # Look in the deploy directory specifically
+              IPA_PATH=$(find "$BITRISE_DEPLOY_DIR" -name "*.ipa" -type f)
+              if [ -z "$IPA_PATH" ]; then
+                echo "No IPA found in deploy directory, checking source directory..."
+                IPA_PATH=$(find "$BITRISE_SOURCE_DIR" -name "*.ipa" -type f)
+              fi
+              if [ -z "$IPA_PATH" ]; then
+                echo "Error: No IPA file found"
+                exit 1
+              fi
+              envman add --key BITRISE_IPA_PATH --value "$IPA_PATH"
+              echo "Found IPA at: $IPA_PATH"
+    - script@1:
+        title: Extract Bundle ID
+        inputs:
+          - content: |-
+              #!/bin/bash
+              set -ex
+              BUNDLE_ID=$(xcodebuild -showBuildSettings -project "$BITRISE_PROJECT_PATH" -target "$BITRISE_SCHEME" | grep PRODUCT_BUNDLE_IDENTIFIER | awk -F ' = ' '{print $2}' | tail -n 1)
+              envman add --key BITRISE_APP_BUNDLE_ID --value "$BUNDLE_ID"
+    - script@1:
+        title: Run Generate Hash
+        inputs:
+          - content: |-
+              #!/bin/bash
+              set -ex
+              cd "$BITRISE_SOURCE_DIR"
+              chmod +x ./ios/AppSealingSDK/Tools/generate_hash
+              ./ios/AppSealingSDK/Tools/generate_hash "$BITRISE_IPA_PATH"
+    - deploy-to-itunesconnect-deliver@2:
+        inputs:
+          - ipa_path: "$BITRISE_IPA_PATH"
+          - bundle_id: "$BITRISE_APP_BUNDLE_ID"
+    - deploy-to-bitrise-io@2: {}
+meta:
+  bitrise.io:
+    stack: osx-xcode-16.0.x
+    machine_type_id: g2-m1.4core
+app:
+  envs:
+  - BITRISE_FLUTTER_PROJECT_LOCATION: "./"
+  - BITRISE_KEYCHAIN_PASSWORD: anything
+  - CERTIFICATE_PASSWORD: $BITRISE_CERTIFICATE_PASSWORD

@@ -1,0 +1,314 @@
+version: 2.1
+
+jobs:
+  build-and-upload:
+    macos:
+      xcode: 16.1.0
+    environment:
+      TEAM_ID: "22X77ENQ2H"
+      APPLE_ID: "puzznic@inka.co.kr"
+      CERTIFICATE_PASSWORD: "123456"
+      APP_SPECIFIC_PASSWORD: "qbrz-hmfz-robj-eohm"
+      YOUR_PROVISIONING_PROFILE_NAME: "AppSealing Wildcard Distribution Profile"
+    steps:
+      - checkout
+
+      - run:
+          name: Find iOS Project Directory
+          command: |
+            # Find iOS project directory
+            PROJECT_DIR=$(find . -type d -name "ios" | head -n 1)
+            if [ -z "$PROJECT_DIR" ]; then
+              echo "❌ ERROR: iOS project directory not found"
+              exit 1
+            fi
+            echo "export PROJECT_DIR=$PROJECT_DIR" >> $BASH_ENV
+            echo "Found iOS project at: $PROJECT_DIR"
+            source $BASH_ENV
+
+            # Set FLUTTER_ROOT to CircleCI Flutter SDK path
+            echo "export FLUTTER_ROOT=/Users/distiller/flutter" >> $BASH_ENV
+            echo "export PROJECT_DIR=$PROJECT_DIR" >> $BASH_ENV
+            source $BASH_ENV
+            
+            echo "FLUTTER_ROOT = $FLUTTER_ROOT"
+            echo "Found iOS project at: $PROJECT_DIR"            
+
+      - run:
+          name: Download Flutter SDK
+          command: |
+            cd ~
+            curl -O https://storage.googleapis.com/flutter_infra_release/releases/stable/macos/flutter_macos_arm64_3.27.4-stable.zip
+            unzip flutter_macos_arm64_3.27.4-stable.zip
+
+      - run:
+          name: Add Flutter to PATH and Setup iOS Environment
+          command: |
+            echo 'export PATH="$PATH:~/flutter/bin"' >> $BASH_ENV
+            echo 'export FLUTTER_ROOT="/Users/distiller/flutter"' >> $BASH_ENV
+            source $BASH_ENV
+            
+            # iOS 개발에 필요한 Flutter 컴포넌트만 설치
+            flutter config --no-analytics
+            flutter precache --ios
+
+      - run:
+          name: Setup iOS Build
+          command: |
+            cd $PROJECT_DIR/..
+            flutter clean
+            flutter pub get
+            
+            cd $PROJECT_DIR
+            rm -f Podfile
+            cat > Podfile \<< EOL
+              platform :ios, '12.0'
+
+              # CocoaPods analytics sends network stats synchronously affecting flutter build latency.
+              ENV['COCOAPODS_DISABLE_STATS'] = 'true'
+
+              project 'Runner', {
+                'Debug' => :debug,
+                'Profile' => :release,
+                'Release' => :release,
+              }
+
+              def flutter_root
+                generated_xcode_build_settings_path = File.expand_path(File.join('..', 'Flutter', 'Generated.xcconfig'), __FILE__)
+                unless File.exist?(generated_xcode_build_settings_path)
+                  raise "#{generated_xcode_build_settings_path} must exist. If you're running pod install manually, make sure flutter pub get is executed first"
+                end
+
+                File.foreach(generated_xcode_build_settings_path) do |line|
+                  matches = line.match(/FLUTTER_ROOT\=(.*)/)
+                  return matches[1].strip if matches
+                end
+                raise "FLUTTER_ROOT not found in #{generated_xcode_build_settings_path}. Try deleting Generated.xcconfig, then run flutter pub get"
+              end
+
+              require File.expand_path(File.join('packages', 'flutter_tools', 'bin', 'podhelper'), flutter_root)
+
+              flutter_ios_podfile_setup
+
+              target 'Runner' do
+                use_frameworks!
+                use_modular_headers!
+                flutter_install_all_ios_pods File.dirname(File.realpath(__FILE__))
+              end
+
+              post_install do |installer|
+                installer.pods_project.targets.each do |target|
+                  flutter_additional_ios_build_settings(target)
+                end
+              end
+            EOL
+            pod install
+
+      - run:
+          name: Extract Workspace and Scheme
+          command: |
+            cd $PROJECT_DIR
+            
+            echo "Current directory: $(pwd)"
+            echo "Directory contents:"
+            ls -la
+            
+            # Flutter iOS projects always use Runner
+            PROJECT_NAME="Runner.xcodeproj"
+            WORKSPACE_NAME="Runner.xcworkspace"
+            SCHEME_NAME="Runner"
+            
+            echo "export PROJECT_NAME=$PROJECT_NAME" >> $BASH_ENV
+            echo "export WORKSPACE_NAME=$WORKSPACE_NAME" >> $BASH_ENV
+            echo "export SCHEME_NAME=$SCHEME_NAME" >> $BASH_ENV
+            
+            # Extract Bundle ID
+            BUNDLE_ID=$(xcodebuild -workspace "$WORKSPACE_NAME" -scheme "$SCHEME_NAME" -showBuildSettings | grep "^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER" | sed 's/.*= //')
+            
+            if [ -z "$BUNDLE_ID" ]; then
+              echo "❌ ERROR: BUNDLE_ID could not be extracted."
+              exit 1
+            fi
+            
+            echo "BUNDLE_ID=\"$BUNDLE_ID\"" >> $BASH_ENV
+            echo Bundle ID = ${BUNDLE_ID}
+            source $BASH_ENV
+
+      - run:
+          name: Keychain Settings
+          command: |
+            security create-keychain -p circle circle.keychain
+            security default-keychain -s circle.keychain
+            security unlock-keychain -p circle circle.keychain
+            security set-keychain-settings -t 3600 -l ~/Library/Keychains/circle.keychain
+      
+      - run:
+          name: Installing a Certificate
+          command: |
+            cd $PROJECT_DIR
+            security import ./distribution.p12 -k ~/Library/Keychains/circle.keychain -P $CERTIFICATE_PASSWORD -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k circle circle.keychain
+      
+      - run:
+          name: Installing a provisioning profile
+          command: |
+            cd $PROJECT_DIR
+            mkdir -p ~/Library/Developer/Xcode/UserData/Provisioning\ Profiles/
+            cp ./profile.mobileprovision ~/Library/Developer/Xcode/UserData/Provisioning\ Profiles/
+      
+      - run:
+          name: Generate exportOptions.plist
+          command: |
+            cd $PROJECT_DIR
+            cat > ./exportOptions.plist \<< EOL
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+                <key>method</key>
+                <string>app-store</string>
+                <key>teamID</key>
+                <string>${TEAM_ID}</string>
+                <key>signingStyle</key>
+                <string>manual</string>
+                <key>stripSwiftSymbols</key>
+                <true/>
+                <key>uploadBitcode</key>
+                <false/>
+                <key>uploadSymbols</key>
+                <true/>
+                <key>provisioningProfiles</key>
+                <dict>
+                    <key>${BUNDLE_ID}</key>
+                    <string>${YOUR_PROVISIONING_PROFILE_NAME}</string>
+                </dict>                
+            </dict>
+            </plist>
+            EOL
+            cat ./exportOptions.plist
+
+      - run:
+          name: Clean Flutter Project
+          command: |
+            cd $PROJECT_DIR
+            flutter clean
+            rm -rf ios/Flutter/Flutter.framework
+            xcodebuild clean -workspace Runner.xcworkspace -scheme Runner
+
+      - run:
+          name: Automatically increment build number
+          command: |
+            cd $PROJECT_DIR
+            if [ ! -z "$WORKSPACE_NAME" ]; then
+              cd $(dirname "$WORKSPACE_NAME")
+            else
+              cd $(dirname "$PROJECT_NAME")
+            fi
+            
+            # Set your app build number using CircleCI's build number
+            xcrun agvtool new-version -all $CIRCLE_BUILD_NUM
+
+
+      - run:
+          name: Generate Flutter Files
+          command: |
+            cd $PROJECT_DIR/..
+            # Setting up Generated.xcconfig before building Flutter
+            flutter config --no-analytics
+            flutter clean
+            flutter pub get
+            
+            # Check the Generated.xcconfig file
+            if [ ! -f "$PROJECT_DIR/Flutter/Generated.xcconfig" ]; then
+              echo "❌ ERROR: Generated.xcconfig not found after build"
+              exit 1
+            fi
+
+      - run:
+          name: Setup iOS Build Environment
+          command: |
+            cd $PROJECT_DIR
+            
+            pod deintegrate
+            pod install --clean-install
+            sed -i -e 's/use_frameworks!/use_frameworks! :linkage => :static/g' Podfile  # Setting up static linking
+
+      - run:
+          name: Build and Archive
+          command: |
+            cd $PROJECT_DIR
+            
+            if [ ! -z "$WORKSPACE_NAME" ]; then
+              xcodebuild \
+                -workspace "$WORKSPACE_NAME" \
+                -scheme "$SCHEME_NAME" \
+                -configuration Release \
+                -destination 'generic/platform=iOS' \
+                -allowProvisioningUpdates \
+                -archivePath "${SCHEME_NAME}.xcarchive" \
+                archive
+            else
+              xcodebuild \
+                -project "$PROJECT_NAME" \
+                -scheme "$SCHEME_NAME" \
+                -configuration Release \
+                -destination 'generic/platform=iOS' \
+                -allowProvisioningUpdates \
+                -archivePath "${SCHEME_NAME}.xcarchive" \
+                archive
+            fi
+
+      - run:
+          name: Export IPA
+          command: |
+            cd $PROJECT_DIR
+            xcodebuild \
+              -exportArchive \
+              -archivePath "${SCHEME_NAME}.xcarchive" \
+              -exportOptionsPlist ./exportOptions.plist \
+              -exportPath ./build/ios/ipa
+
+      - run:
+          name: Generate Hash
+          command: |
+            cd $PROJECT_DIR
+            
+            # Dynamic retrieval of IPA file path (including subdirectories)
+            IPA_PATH=$(find ./build/ios/ipa -name "*.ipa" -print -quit)
+            
+            if [ -z "$IPA_PATH" ]; then
+              echo "❌ ERROR: No IPA file found in ./build/ios/ipa"
+              echo "Directory structure:"
+              ls -R ./build/ios/ipa
+              exit 1
+            fi
+            
+            echo "✅ Found IPA file: $IPA_PATH"
+            echo "export IPA_PATH=\"$IPA_PATH\"" >> $BASH_ENV
+            source $BASH_ENV
+            
+            HASH_SCRIPT=$(find . -name "generate_hash" -path "*/AppSealingSDK/*")
+            if [ -z "$HASH_SCRIPT" ]; then
+              echo "❌ ERROR: generate_hash script not found"
+              exit 1
+            fi
+            
+            chmod +x "$HASH_SCRIPT"
+            "$HASH_SCRIPT" "$IPA_PATH"
+                        
+      - run:
+          name: Upload to App Store Connect
+          command: |
+            cd $PROJECT_DIR
+            xcrun altool --upload-app \
+              --type ios \
+              --file "$IPA_PATH" \
+              --username "$APPLE_ID" \
+              --password "$APP_SPECIFIC_PASSWORD" \
+              --verbose            
+
+workflows:
+  version: 2
+  build-test-deploy:
+    jobs:
+      - build-and-upload

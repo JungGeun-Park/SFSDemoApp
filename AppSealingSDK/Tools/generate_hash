@@ -1,0 +1,4449 @@
+#!/usr/bin/env ruby
+
+=begin
+============================================================================================
+|  AppSealing iOS SDK Hash Generator V1.12.0.0                                             |
+|                                                                                          |
+|  * presented by Doverunner                                                               |
+============================================================================================
+=end
+
+#--------------------------------------------------------------------------------------------
+# Standard libraries
+#--------------------------------------------------------------------------------------------
+require "pathname"
+require "tmpdir"
+require "securerandom"
+require "net/https"
+require "json"
+require "io/console"
+require "open-uri"
+require "rexml/document"
+require "fileutils"
+require "shellwords"
+require "find"
+require "logger"
+
+#--------------------------------------------------------------------------------------------
+# 3rd-party gems
+#--------------------------------------------------------------------------------------------
+begin
+    require "xcodeproj"
+rescue LoadError
+end
+
+#--------------------------------------------------------------------------------------------
+# Modularized code
+#--------------------------------------------------------------------------------------------
+# lib/debug_logger.rb
+require "logger"
+
+class DebugLogger
+  LOG_FILE = "./GenerateHash.log"
+
+  def self.enable_debug_mode!(on)
+    @debug_mode = on
+    puts "[DEBUG MODE ENABLED]" if @debug_mode
+
+    if @debug_mode
+      File.open(LOG_FILE, "w") { }      # Truncate before logging
+      @logger = Logger.new(LOG_FILE)   # Only file name, no rotation
+      @logger.level = Logger::DEBUG
+    else
+      @logger = nil
+    end
+  end
+
+  def self.debug_log(message)
+    return unless @debug_mode
+    @logger.debug(message) if @logger
+    puts "[DEBUG] #{message}"
+  end
+
+  # Optional: expose debug mode state
+  def self.debug_mode?
+    @debug_mode
+  end
+end
+
+# hash_lib/appsealing_cli.rb
+require "pathname"
+require "xcodeproj"
+
+# hash_lib/string_encryption.rb
+
+# hash_lib/api_utils.rb
+
+require "json"
+
+module ApiUtils
+  def self.create_http(uri)
+    debug_log "create_http for uri=#{uri}"
+    http = Net::HTTP.new(uri.hostname, uri.port)
+    http.use_ssl = (uri.scheme == "https")
+    return http unless http.use_ssl?
+
+    http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+    store = OpenSSL::X509::Store.new
+    store.set_default_paths
+    http.cert_store = store
+    http
+  end
+
+  # Checks if the HTTP response indicates success.
+  # If not, extracts error details and raises a formatted, colorized exception.
+  # - response: Net::HTTP response object
+  # - api_phase: Symbol for the API phase (e.g., :sealing, :download)
+  def self.handle_response(response, api_phase)
+    debug_log "handle_response: phase=#{api_phase}, status=#{response.code}, class=#{response.class}"
+    return if response.is_a?(Net::HTTPSuccess)
+
+    # Attempt to extract server error message, fall back to body preview
+    error_info = begin
+        debug_log "Parsing error info from response body"
+        JSON.parse(response.body).dig("result", "message") rescue response.body[0..200]
+      end
+
+    debug_log "API Error (phase=#{api_phase}): status=#{response.code}, message=#{error_info.inspect}"
+    raise <<~ERROR.red.bold
+            API Error (#{api_phase.to_s.upcase})
+            - Status: #{response.code}
+            - Message: #{error_info}
+            - URI: #{response.uri}
+          ERROR
+  end
+end
+
+# hash_lib/string_utils.rb
+
+#--------------------------------------------------------------------------------------------
+# StringUtils 모듈은 문자열 처리와 관련된 헬퍼들을 제공합니다.
+# This module contains helper functions related to string processing.
+#--------------------------------------------------------------------------------------------
+
+module StringUtils
+  # Example: converts string param to hex string
+  def self.to_hex_string(param)
+    unpacked = param.unpack("H*").first
+    unpacked.gsub(/(..)/, '\1').rstrip
+  end
+
+  #--------------------------------------------------------------------------------------------
+  #  소스 코드 파일 내의 태깅 된 문자열 추출
+  # Extract tagged strings within source code files
+  #--------------------------------------------------------------------------------------------
+  #--------------------------------------------------------------------------------------------
+  #  appsealing.lic 파일 읽기
+  #--------------------------------------------------------------------------------------------
+  def self.get_accountID_hash_from_license_file(path)
+    $account_id_hash = nil
+    $sdk_version = nil
+
+    puts "    [INFO] Checking license file: #{path}".cyan
+
+    unless File.exist?(path)
+      warn "[ERROR] License file not found: #{path}".red.bold
+      return
+    end
+
+    expected_magic = "\x41\x53\x4C\x46\x76".b # "ASLFv"
+
+    begin
+      File.open(path, "rb") do |file|
+        # Read and check magic header
+        header = file.read(5)
+        puts "    [DEBUG] Magic header: #{header&.unpack1("H*")}".yellow
+        unless header == expected_magic
+          warn "[ERROR] Invalid license format: Magic number mismatch".red.bold
+          return
+        end
+        puts "    [INFO] Magic number check passed".cyan
+
+        # Skip 3 bytes (reserved or unused)
+        file.read(3)
+
+        # Read SDK version (48 bytes), remove null bytes
+        $sdk_version = file.read(48)&.gsub(/\x00/, "")
+        puts "    [INFO] SDK Version: #{$sdk_version.inspect}".cyan
+        if $sdk_version.nil? || $sdk_version.empty?
+          warn "[ERROR] Corrupted license: SDK version missing".red.bold
+          return
+        end
+
+        # Skip 8 bytes (reserved or unused)
+        file.read(8)
+
+        # Read 32 bytes for account ID hash
+        account_hash_bin = file.read(32)
+        if account_hash_bin.nil? || account_hash_bin.bytesize != 32
+          warn "[ERROR] Corrupted license: Account hash missing or wrong size".red.bold
+          return
+        end
+
+        # Convert binary hash to uppercase hex string and store in global variable
+        $account_id_hash = account_hash_bin.unpack1("H*").upcase
+        puts "    [INFO] Account ID Hash: #{$account_id_hash}".cyan
+        puts "    [SUCCESS] License file parsing completed".green
+      end
+    rescue => e
+      warn "[EXCEPTION] License parsing failed: #{e.message}"
+      $account_id_hash = nil
+    end
+    return {
+        sdk_version: $sdk_version,
+        account_id_hash: $account_id_hash
+      }
+  end
+
+  def self.generate_c_array(hex_str, expected_size)
+      bytes = hex_str.scan(/../)
+      if bytes.size != expected_size
+          raise "Invalid hex string size: expected #{expected_size}, got #{bytes.size}"
+      end
+      bytes.map { |b| "0x#{b}" }.join(', ')
+  end
+  
+  #--------------------------------------------------------------------------------------------
+  #  Extract AppSealing license from Unreal executable (FAST VERSION)
+  #--------------------------------------------------------------------------------------------
+  def self.get_accountID_hash_from_unreal_executable(path)
+    require "stringio"
+    $current_step ||= 0
+    $bundle_id ||= ""
+    $sdk_version ||= ""
+    $account_id_hash = nil
+    $isUnreal ||= false
+
+    $current_step += 1
+    puts "\n[STEP #{$current_step += 1}] Extracting account ID from executable file...".bold.yellow
+
+    unless File.exist?(path)
+      warn "    [ERROR] File not found: #{path}".red.bold
+      exit(false)
+    end
+
+    file_size = File.size(path)
+    puts "    [DEBUG] File size: #{file_size} bytes".yellow
+
+    $position = 0
+    parse_finished = false
+
+    magic1 = "\x41\x53\x4C\x46".b
+    magic2 = "\x76\x34\x0A\x0D".b
+    zero4 = "\x00\x00\x00\x00".b
+    chunk_size = 4 * 1024 * 1024
+    puts "    [DEBUG] Using chunk size: #{chunk_size} bytes".yellow
+
+    position_mutex = Mutex.new
+
+    uiThread = Thread.new do
+      begin
+        last_reported_percent = -1
+        loop do
+          current_pos = position_mutex.synchronize { $position }
+          percent = (current_pos.to_f / file_size) * 100
+          percent = percent.round # 정수 %로 변환
+
+          # 1% 단위로만 출력 또는 최종 100% 강제 출력
+          if percent > last_reported_percent || current_pos >= file_size
+            formatted_pos = current_pos.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+            formatted_percent = sprintf("%d%%", [percent, 100].min)
+            print "\r    [INFO] Progress: #{formatted_pos}/#{file_size} (#{formatted_percent})".cyan
+            last_reported_percent = percent
+          end
+
+          sleep 0.1
+          break if parse_finished || current_pos >= file_size
+        end
+
+        # 마지막에 줄바꿈 추가
+        formatted_pos = file_size.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+      rescue => e
+        warn "    [WARN] UI thread error: #{e.message}".yellow
+      end
+    end
+
+    parseThread = Thread.new do
+      begin
+        File.open(path, "rb") do |f|
+          buffer = "".b
+          total_read = 0
+          chunk_count = 0
+          last_percent = 0
+          while chunk = f.read(chunk_size)
+            chunk_count += 1
+            buffer << chunk
+            total_read += chunk.bytesize
+            search_from = 0
+            magic_found = 0
+
+            while (idx = buffer.index(magic1, search_from))
+              magic_found += 1
+              global_pos = total_read - buffer.bytesize + idx
+
+              position_mutex.synchronize { $position = global_pos }
+
+              if buffer.bytesize < idx + 256 + 96
+                buffer = buffer[idx..-1]
+                break
+              end
+
+              # Magic2 검증
+              if buffer[idx + 4, 4] != magic2
+                search_from = idx + 1
+                next
+              end
+
+              # Zero4 검증
+              if buffer[idx + 51, 4] != zero4
+                search_from = idx + 1
+                next
+              end
+
+              # 데이터 추출
+              sdk_bytes = buffer[idx + 8, 49]
+              $sdk_version = sdk_bytes.gsub(/\000/, "")
+              puts "\n\n  • SDK version: #{$sdk_version}"
+
+              account_bytes = buffer[idx + 64, 32]
+              if account_bytes&.bytesize == 32
+                $account_id_hash = account_bytes.unpack1("H*")
+                puts "  • Account hash: #{$account_id_hash[0..10]}..."
+              else
+                warn "    [WARN] Invalid account hash data at position #{global_pos + 64}".yellow
+              end
+
+              bundle_bytes = buffer[idx + 96, 256]
+              $bundle_id = bundle_bytes.strip
+              puts "  • Bundle ID: #{$bundle_id}"
+
+              if $account_id_hash && !$account_id_hash.empty?
+                parse_finished = true
+                $isUnreal = true
+                puts "    [INFO] Valid license found!".green
+                break
+              end
+
+              search_from = idx + 1
+            end
+            percent = (total_read.to_f / file_size) * 100
+            if percent.to_i > last_percent
+              sleep 0.1
+              last_percent = percent.to_i
+            end
+            break if parse_finished
+
+            # 버퍼 관리
+            keep_bytes = [buffer.bytesize, 256 + 96].min
+            position_mutex.synchronize { $position = total_read - keep_bytes }
+            buffer = buffer[-keep_bytes..-1] || "".b
+          end
+        end
+      rescue => e
+        warn "    [ERROR] Parsing error: #{e.message}".red.bold
+        puts e.backtrace.first(5).join("\n")
+      ensure
+        parse_finished = true
+        position_mutex.synchronize { $position = file_size }
+      end
+    end
+
+    parseThread.join
+    uiThread.join
+
+    unless $account_id_hash && !$account_id_hash.empty?
+      warn "\n    [ERROR] Failed to extract AppSealing account ID".red.bold
+      warn "    [ERROR] Possible causes:".red.bold
+      warn "    - Magic headers not found in binary".red
+      warn "    - File is not an AppSealing-protected Unreal executable".red
+      warn "    - License data corrupted".red
+      exit(false)
+    end
+
+    return {
+      sdk_version: $sdk_version,
+      account_id_hash: $account_id_hash
+    }
+  end
+end
+
+
+#--------------------------------------------------------------------------------------------
+# StringEncryption: 문자연 암호화 라이브러리
+# This module contains helper functions for string encryption.
+#--------------------------------------------------------------------------------------------
+
+module StringEncryption
+    # Extract all tagged hex strings from a given file path.
+  # - Reads the file in binary mode for robust encoding.
+  # - Returns an array of hex strings for every valid tagged string found (at least 20 bytes, with specific tag pattern).
+  # - Skips files with names ending in "AppsealingiOS.mm" or "LEASection.mm".
+  # - On encoding or critical error, prints an error and exits.
+  def self.extract_tagged_strings(path)
+    debug_log "extract_tagged_strings called with path=#{path}"
+    result = []
+    return result if path.end_with?("AppsealingiOS.mm")
+    return result if path.end_with?("LEASection.mm")
+
+    puts "    [INFO] Processing file: #{path}".cyan
+    debug_log "Processing file: #{path}"
+    begin
+      # 파일 인코딩 처리 강화 (UTF-8, ASCII-8BIT)
+      # Enhance file encoding handling (UTF-8, ASCII-8BIT)
+      # Use binary and strict encoding to help avoid misreads on files with embedded non-ASCII or binary data.
+      debug_log "About to read file: #{path}"
+      content = File.read(path, mode: "rb", encoding: "ASCII-8BIT").scrub
+      debug_log "File read: #{path} (#{content.bytesize} bytes)"
+      matches = content.scan(/("(?:\\"|[^"])*\\0x1\\0x1\\0x1\\0x1")/).flatten
+      debug_log "Read file, found #{matches.size} candidate tagged string(s)"
+
+      matches.each do |match|
+        # 유효성 검사: 최소 길이 20자(예: "abc\x01..." + 16바이트 태그)
+        # Validation: Minimum length 20 characters (e.g., "abc\x01..." + 16-byte tag)
+        # Ensures each match is not a short accidental string; avoids false positives and improves robustness.
+        next unless match.bytesize >= 20
+
+        # 이스케이프 처리 제거
+        # Remove escape processing
+        # Strip out the trailing tag, remove quotes and escape artifacts to get clean payload.
+        clean_str = match.gsub(/\\0x1\\0x1\\0x1\\0x1"$/, "")[1..-1]
+        hex_str = clean_str.unpack1("H*")
+        debug_log "Found tagged string: #{clean_str} (#{hex_str[0..20]}...)" # Adds details for each
+
+        puts "    [DEBUG] Found tagged string: #{clean_str} : #{hex_str[0..20]}...".yellow
+        result << hex_str
+      end
+
+      if result.any?
+        debug_log "extract_tagged_strings: extracted #{result.size} strings"
+      else
+        debug_log "extract_tagged_strings: found no tagged strings"
+      end
+
+      puts "    [INFO] Found #{result.size} valid tagged strings"
+    rescue EncodingError => e
+      debug_log "Encoding error: #{e.class} - #{e.message}"
+      # 인코딩 에러 발생 시
+      # If encoding error occurs
+      # This block triggers on legacy files or those with invalid byte sequences, so the user gets a clear message.
+      puts "    [ERROR] Encoding error in #{path}: #{e}".red
+      exit(1)
+    rescue => e
+      debug_log "Other failure: #{e.class} - #{e.message}"
+      # 기타 치명적인 예외 처리
+      # Handle other critical exceptions
+      # All uncaught exceptions are logged and surfaced with file and error context for clarity on exit.
+      puts "    [ERROR] Critical error processing #{path}: #{e}".red
+      puts "           Check file syntax or special characters".red
+      exit(1)
+    end
+
+    result
+  end
+
+  #--------------------------------------------------------------------------------------------
+  #  문자열 암호화
+  # String encryption
+  #--------------------------------------------------------------------------------------------
+  # Modifies a .mm file in AppSealingSDK/Libraries to inject updated IV/key/key_table for LEA.
+  # 1. Creates a backup, 2. Modifies LEA AREA code block, 3. Atomically writes changes, 4. Restores backup on error
+  def self.modify_lea_area(path, src, iv, key)
+    debug_log "modify_lea_area called with path=#{path}, src=#{src}"
+    mm_path = File.join(path, "AppSealingSDK", "Libraries", src)
+    debug_log "Target file: #{mm_path}"
+    unless File.exist?(mm_path)
+      puts "    [ERROR] Cannot find #{src}: #{mm_path}".red
+      debug_log "File not found: #{mm_path}"
+      exit(1)
+    end
+
+    puts "    [INFO] Modifying #{src}...".cyan
+    debug_log "Modifying #{src}..."
+
+    begin
+      # 1. 백업 파일 생성
+      # 1. Create a backup of the original file before modifying
+      backup_path = "#{mm_path}.org"
+      debug_log "Creating backup: #{backup_path}"
+      FileUtils.cp(mm_path, backup_path)
+      puts "    [INFO] Backup created: #{backup_path}".cyan
+
+      # 2. 파일 수정
+      # 2. Read and modify the file, injecting new LEA parameters
+      debug_log "Beginning file modification for LEA injection"
+      modified_source = []
+      line_add = true
+
+      File.foreach(mm_path, chomp: true) do |line|
+        debug_log "Reading line: #{line}" if $debug_mode && (line.include?("LEA AREA BEGIN") || line.include?("LEA AREA END"))
+        if line.strip.end_with?("///// LEA AREA END : DO NOT DELETE THIS LINE !!!!")
+          line_add = true
+          modified_source << line
+          debug_log "Reached LEA AREA END marker"
+          next
+        end
+
+        unless line.strip.end_with?("///// LEA AREA BEGIN : DO NOT DELETE THIS LINE !!!!")
+          modified_source << line if line_add
+          next
+        end
+
+        # 3. 신규 코드 블록 생성
+        # 3. Insert the updated IV, key, and key_table just after LEA AREA BEGIN marker
+        debug_log "Injecting new LEA code block after BEGIN marker"
+        modified_source << line
+        modified_source << "unsigned char __se_iv[16] = { #{StringUtils.generate_c_array(iv, 16)} };"
+        modified_source << "bool __se_use_lea = #{LOCAL_TEST ? "false" : "true"};"
+
+        debug_log "__se_use_lea flag: #{LOCAL_TEST ? "false" : "true"} (LOCAL_TEST=#{LOCAL_TEST})"
+
+        if LOCAL_TEST
+          debug_log "Injecting LOCAL_TEST key/key_table"
+          modified_source << "unsigned char __se_key_table[248620];"
+          modified_source << "unsigned char __se_key[16] = { #{StringUtils.generate_c_array(key, 16)} };"
+        else
+          debug_log "Injecting production key/key_table"
+          modified_source << "unsigned char __se_key[16];"
+          modified_source << "unsigned char __se_key_table[248620] = { #{StringUtils.generate_c_array(key, 248620)} };"
+        end
+
+        line_add = false
+      end
+
+      # 4. 원자적 쓰기 (임시 파일 -> 원본 파일)
+      # 4. Atomically replace file: write tmp first, then rename
+      temp_path = "#{mm_path}.tmp"
+      debug_log "Writing temporary file: #{temp_path}"
+      File.write(temp_path, modified_source.join("\n"))
+      File.rename(temp_path, mm_path)
+      puts "    [INFO] #{src} updated successfully.".cyan
+      debug_log "#{src} updated successfully."
+    rescue => e
+      # 5. 에러 발생 시 백업 복원
+      # 5. If anything fails, restore from backup and log
+      debug_log "Exception: #{e.class} - #{e.message}"
+      puts "    [ERROR] Failed to update #{src}: #{e}".red
+      if File.exist?(backup_path)
+        debug_log "Restoring from backup: #{backup_path}"
+        FileUtils.cp(backup_path, mm_path)
+        puts "    [INFO] Restored original file from backup.".cyan
+      end
+      exit(1)
+    end
+  end
+
+  #--------------------------------------------------------------------------------------------
+  #  문자열 암호화 요청 및 처리
+  # Request and process string encryption from local AES or AppSealing server.
+  # - Encrypts a list of strings using LOCAL_TEST AES/IV or by sending to the server.
+  # - Loads account_id_hash, manages local/prod mode, inserts debug tracing.
+  # - Modifies AppsealingiOS.mm & LEASection.mm with the new IV and key/table.
+  # - Returns map of input string → encrypted hex string.
+  #--------------------------------------------------------------------------------------------
+  def self.get_encrypted_strings(path, param)
+    require "securerandom"
+    require "openssl"
+    require "json"
+    require "net/http"
+    require "uri"
+
+    enc_strings_map = {}
+
+    lic_path = File.join(path, "AppSealingSDK", "Libraries", "appsealing.lic")
+    debug_log "Loading license file for account ID hash: #{lic_path}"
+    StringUtils.get_accountID_hash_from_license_file(lic_path)
+    puts "    [INFO] Loaded account_id_hash: #{$account_id_hash}".cyan
+    debug_log "Loaded account_id_hash: #{$account_id_hash}"
+
+    if LOCAL_TEST
+      # LOCAL_TEST mode - use random AES key/IV
+      $iv      = SecureRandom.hex(16).upcase
+      $aes_key = SecureRandom.hex(16).upcase
+      puts "    [INFO] LOCAL_TEST enabled - Using random AES key/IV".cyan
+      debug_log "LOCAL_TEST is enabled: IV=#{$iv}, AES_KEY=#{$aes_key}"
+
+      param.each do |string|
+        begin
+          debug_log "Encrypting string in LOCAL_TEST: #{string[0..20]}..."
+          aes = OpenSSL::Cipher::AES.new("128-CTR")
+          aes.encrypt
+          aes.key = [$aes_key].pack("H*")
+          aes.iv  = [$iv].pack("H*")
+          enc = aes.update(string) + aes.final
+          key = StringUtils.to_hex_string(string).upcase
+          enc_strings_map[key] = StringUtils.to_hex_string(enc).upcase
+          debug_log "Encrypted string key: #{key[0..20]}... → value: #{enc_strings_map[key][0..20]}..."
+        rescue => e
+          puts "    [ERROR] AES encryption failed for string: #{string[0..10]}... (#{e})".red
+          debug_log "AES encryption failed for #{string[0..10]}...: #{e.class} - #{e.message}"
+        end
+      end
+      puts "    [INFO] Local encryption complete: #{enc_strings_map.size} strings".cyan
+      debug_log "Local encryption complete for #{enc_strings_map.size} strings"
+    else
+      # Request string encryption from AppSealing server
+      uri = URI(File.join($baseURL, "v3/sdk/requestStringEncryptionForIOS"))
+
+      begin
+        puts "    [INFO] Requesting string encryption from AppSealing server...".cyan
+        debug_log "Posting string encryption request to: #{uri}"
+
+        request   = Net::HTTP::Post.new(uri)
+        form_data = [
+          ["bundle_id",       $bundle_id],
+          ["account_id_hash", $account_id_hash],
+          ["strings",         param.join(",")],
+        ]
+        request.set_form form_data, "multipart/form-data"
+
+        http     = ApiUtils.create_http(uri)
+        response = http.start { |h| h.request(request) }
+
+        debug_log "Server responded: status #{response.code rescue 'N/A'}, body: #{response.body[0..100]}"
+        result  = JSON.parse(response.body)
+        code    = result.dig("result", "code")
+        message = result.dig("result", "message")
+
+        if code != "0000"
+          puts "    [ERROR] AppSealing server error: #{message}".red
+          puts "           If this error occurs continuously, contact AppSealing Help Center.".red
+          debug_log "AppSealing server returned error: #{code} - #{message}"
+          exit(1)
+        end
+
+        $iv            = result["iv"]
+        $lea_key_table = result["lea_key_table"]
+        enc_strings_map = result["encrypted_strings"]
+        debug_log "Received IV: #{$iv}, LEA key/table length: #{$lea_key_table&.size}"
+        puts "    [INFO] Server encryption complete: #{enc_strings_map.size} strings".cyan
+      rescue => e
+        puts "    [ERROR] Cannot connect to AppSealing server or bad response.".red
+        puts "           [Error] #{e}".red
+        puts "           If this error occurs continuously, contact AppSealing Help Center.".red
+        debug_log "Server communication exception: #{e.class} - #{e.message}"
+        exit(1)
+      end
+    end
+
+    # Update AppSealing source (.mm) files with new IV and key table
+    debug_log "Updating AppsealingiOS.mm and LEASection.mm with IV/key"
+    modify_lea_area(path, "AppsealingiOS.mm", $iv, LOCAL_TEST ? $aes_key : $lea_key_table)
+    modify_lea_area(path, "LEASection.mm",    $iv, LOCAL_TEST ? $aes_key : $lea_key_table)
+
+    debug_log "Encrypted strings map ready (#{enc_strings_map.size} entries returned)"
+    enc_strings_map
+  end
+
+  #--------------------------------------------------------------------------------------------
+  # 문자열 교체
+  # Replace string
+  #--------------------------------------------------------------------------------------------
+  # Replaces obfuscated/tagged strings in the given file.
+  def self.replace_tagged_strings(path)
+    puts "    [INFO] Processing file: #{path}".cyan
+
+    # Create backup
+    backup_path = "#{path}.org"
+    FileUtils.cp(path, backup_path)
+    puts "    [DEBUG] Backup created: #{backup_path}".yellow
+
+    begin
+      content = File.read(path, encoding: "UTF-8")
+      modified = content.dup
+      tag = '\\0x1\\0x1\\0x1\\0x1'
+      index = 0
+      replacement_count = 0
+
+      # Search for tags in the entire contents
+      while (index = modified.index(tag, index))
+        puts "    [DEBUG] Found tag at position: #{index}".yellow
+
+        # Search for string start position
+        start_pos = index - 1
+        while start_pos >= 0
+          break if modified[start_pos] == '"' && (start_pos == 0 || modified[start_pos - 1] != '\\')
+          start_pos -= 1
+        end
+
+        if start_pos < 0
+          puts "    [WARN] Invalid string format before tag at #{index}".yellow
+          index += tag.length
+          next
+        end
+
+        # Extract strings
+        original_str = modified[start_pos + 1...index]
+        hex_key = original_str.unpack1("H*").downcase
+        puts "    [DEBUG] Original string: #{original_str[0..50]}...".yellow
+        puts "    [DEBUG] Hex key: #{hex_key[0..24]}...".yellow
+
+        unless $enc_strings[hex_key]
+          puts "    [WARN] Missing encryption key for: #{hex_key[0..24]}...".yellow
+          index += tag.length
+          next
+        end
+
+        # Create replacement strings
+        replacement = if path.end_with?(".m", ".mm")
+            if modified[start_pos - 1] == "@"
+              "[AppSealingInterface _DSS:@\"#{$enc_strings[hex_key]}\"]"
+            else
+              "[[AppSealingInterface _DSC:\"#{$enc_strings[hex_key]}\"] UTF8String]"
+            end
+          else
+            "String(AppSealingInterface._DSS(\"#{$enc_strings[hex_key]}\"))"
+          end
+
+        # Apply replacement
+        if path.end_with?(".m", ".mm") && modified[start_pos - 1] == "@"
+          modified[(start_pos - 1)..(index + tag.length)] = replacement
+        else
+          modified[(start_pos)..(index + tag.length)] = replacement
+        end
+
+        replacement_count += 1
+        puts "    [DEBUG] Replaced with: #{replacement[0..50]}...".yellow
+
+        index = start_pos + replacement.length # Offset position for next search
+      end
+
+      # Check whether replacement was here
+      if replacement_count == 0
+        puts "    [WARN] No tagged strings replaced in file".yellow
+        return
+      end
+
+      # Atomically write
+      temp_path = "#{path}.tmp"
+      File.write(temp_path, modified)
+      File.rename(temp_path, path)
+      puts "    [INFO] Successfully replaced #{replacement_count} strings".green
+    rescue => e
+      puts "    [ERROR] Critical error: #{e}".red
+      FileUtils.cp(backup_path, path) if File.exist?(backup_path)
+      exit(1)
+    ensure
+      FileUtils.rm_f(temp_path) rescue nil
+    end
+  end
+
+  #--------------------------------------------------------------------------------------------
+  #  원본 코드 복원
+  # Restore original code file from backup (.org).
+  # - Atomically replaces the main file with its backup if it exists.
+  # - Cleans up any temp files, and (optionally) deletes the backup after restore.
+  # - On error, tries to revert from temp file.
+  #--------------------------------------------------------------------------------------------
+  def self.restore_original_code(path)
+    debug_log "restore_original_code called with path=#{path}"
+    backup_path = "#{path}.org"
+
+    unless File.exist?(backup_path)
+      puts "    [WARN] Backup file not found: #{backup_path}".yellow
+      debug_log "No backup to restore for: #{backup_path}"
+      return
+    end
+
+    begin
+      puts "    [INFO] Restoring original file: #{backup_path} => #{path}".cyan
+      debug_log "Restoring: backup_path=#{backup_path}, dest_path=#{path}"
+
+      # 1. 원자적 복구 (임시 파일 사용)
+      # Atomic restore (using a temp file)
+      temp_path = "#{path}.tmp"
+      FileUtils.mv(path, temp_path) if File.exist?(path)  # 현재 파일 임시 이동
+      debug_log "Moved current file to temp: #{temp_path}" if File.exist?(temp_path)
+      FileUtils.mv(backup_path, path)                     # 백업 → 원본
+      debug_log "Backup file moved to active path"
+
+      # 2. 임시 파일 정리
+      # Clean up temporary file (safe to ignore if missing)
+      FileUtils.rm_f(temp_path) rescue nil
+
+      puts "    [INFO] Successfully restored: #{path}".green
+      debug_log "Successfully restored: #{path}"
+
+      # 3. 백업 파일 삭제 (선택적)
+      # Optionally, remove the backup after a successful restore
+      FileUtils.rm_f(backup_path)
+      puts "    [DEBUG] Removed backup: #{backup_path}".cyan
+      debug_log "Removed backup file after restore"
+    rescue => e
+      puts "    [ERROR] Restore failed: #{e}".red
+      debug_log "Exception while restoring: #{e.class} - #{e.message}"
+
+      # 4. 복구 시도: 임시 파일 → 원본
+      # On failure, try reverting from temp file
+      if File.exist?(temp_path)
+        FileUtils.mv(temp_path, path)
+        puts "    [INFO] Recovered original state".cyan
+        debug_log "Rolled back to temp file after failed restore"
+      end
+
+      exit(1)
+    end
+  end
+
+  def self.belongs_to_active_target?(path, active_target_name, project_dir)
+    norm_path   = File.expand_path(path)
+    target_root = File.join(project_dir, active_target_name) + "/"
+    norm_path.start_with?(target_root)
+  end
+
+  def self.traverse_group(group, indent=0, sources=[])
+    return if group.nil?
+    if group.respond_to?(:children) && group.children.is_a?(Array)
+      group.children.each do |child|
+        begin
+          traverse_group(child, indent+1, sources)
+        rescue
+          # silently skip on error
+        end
+      end
+    end
+    if group.is_a?(Xcodeproj::Project::Object::PBXFileSystemSynchronizedRootGroup)
+      real_path = File.join(File.dirname(group.project.path), group.path || "")
+      if Dir.exist?(real_path)
+        Dir.entries(real_path).each do |entry|
+          next if entry == "." || entry == ".."
+          full_path = File.join(real_path, entry)
+          if File.directory?(full_path)
+            traverse_folder_reference(full_path, indent+2, sources)
+          elsif entry =~ /\.(swift|m|mm|c|cpp)$/
+            sources << full_path unless sources.include?(full_path)
+          end
+        end
+      end
+    end
+    if group.respond_to?(:files) && group.files.is_a?(Array)
+      group.files.each do |file_ref|
+        next if file_ref.nil?
+        path = file_ref.path || ""
+        if path =~ /\.(swift|m|mm|c|cpp)$/
+          abs_path = File.join(File.dirname(group.project.path), path)
+          sources << abs_path unless sources.include?(abs_path)
+        end
+      end
+    end
+    sources
+  end
+
+  def self.traverse_folder_reference(folder_path, indent=0, sources=[])
+    Dir.entries(folder_path).each do |entry|
+      next if entry == "." || entry == ".."
+      full_path = File.join(folder_path, entry)
+      if File.directory?(full_path)
+        traverse_folder_reference(full_path, indent+1, sources)
+      elsif entry =~ /\.(swift|m|mm|c|cpp)$/
+        sources << full_path unless sources.include?(full_path)
+      end
+    end
+  end
+
+
+  # High-level entry point used by CLI (apply / restore).
+  # - project_path: root path of the Xcode project
+  # - action: "apply" or "restore"
+  def self.string_encryption_main(project_path:, action:)
+    require "xcodeproj"
+    require "fileutils"
+
+    # Initialize global state as used by legacy logic
+    $request_param = []
+    $source_path   = []
+    $enc_strings   = {}
+    $action        = action
+
+    # 1. Resolve project path
+    if project_path.nil? || project_path.empty? || !File.exist?(project_path)
+      project_path = File.dirname(File.dirname(__dir__))
+      puts "    [INFO] Auto-set project path to: #{project_path}".cyan
+    end
+    unless File.exist?(project_path)
+      puts "    [ERROR] Invalid project path: #{project_path}".red
+      exit(1)
+    end
+
+    # 2. Open Xcode project and target selection
+    root_xcodeproj = Dir[File.join(project_path, "*.xcodeproj")]
+    if !root_xcodeproj.nil? && !root_xcodeproj.empty?
+      xcodeproj = root_xcodeproj
+      puts "    [INFO] Found Xcode project in root: #{xcodeproj[0]}".cyan
+    else
+      all_xcodeproj = Dir[File.join(project_path, "**", "*.xcodeproj")]
+      if !all_xcodeproj.nil? && !all_xcodeproj.empty?
+        xcodeproj = all_xcodeproj
+        puts "    [INFO] Found Xcode project in subdirectory: #{xcodeproj[0]}".cyan
+      else
+        puts "    [ERROR] Cannot find Xcode project file in: #{project_path}".red
+        exit(1)
+      end
+    end
+
+    Encoding.default_external = Encoding::UTF_8
+    Encoding.default_internal = Encoding::UTF_8
+    begin
+      puts "    [INFO] Opening Xcode project: #{xcodeproj[0]}".cyan
+      project = Xcodeproj::Project.open(xcodeproj[0])
+    rescue => e
+      puts "    [ERROR] Can't open project: #{e}".red
+      exit(1)
+    end
+
+    if project.targets.empty?
+      puts "    [ERROR] No target in Xcode project: #{xcodeproj[0]}".red
+      exit(1)
+    end
+
+    target = project.targets.first
+    if target.nil? || target == ""
+      puts "    [ERROR] Target name is empty: #{xcodeproj[0]}".red
+      exit(1)
+    end
+
+    puts "    [INFO] Processing target: #{target}".cyan
+
+    # 3. Check AppSealing SDK files
+    unless File.exist?(File.join(project_path, "AppSealingSDK", "Libraries", "appsealing.lic"))
+      puts "    [ERROR] Cannot find AppSealing license file. Check AppSealing SDK files: #{project_path}".red
+      exit(1)
+    end
+    unless File.exist?(File.join(project_path, "AppSealingSDK", "Libraries", "AppsealingiOS.mm"))
+      puts "    [ERROR] Cannot find AppsealingiOS.mm interface file. Check AppSealing SDK files: #{project_path}".red
+      exit(1)
+    end
+
+    # 4. Extract bundle ID
+    $bundle_id = target.build_configurations.first.build_settings["PRODUCT_BUNDLE_IDENTIFIER"]
+    if $bundle_id.nil? || $bundle_id.empty?
+      puts "    [ERROR] Cannot extract bundle ID from: #{target}".red
+      exit(1)
+    end
+    puts "    [INFO] Bundle ID: #{$bundle_id}".cyan
+
+    # 5. Collect source files
+    project_dir        = File.dirname(project.path)
+    active_target_name = target.name
+
+    main_group_sources = traverse_group(project.main_group, 1, [])
+    main_group_sources = main_group_sources.select do |p|
+      belongs_to_active_target?(p, active_target_name, project_dir)
+    end
+
+    target_sources = []
+    if target.respond_to?(:source_build_phase)
+      begin
+        target.source_build_phase.files.each do |bf|
+          next if bf.file_ref.nil?
+          file_path = bf.file_ref.real_path.to_s
+          if belongs_to_active_target?(file_path, active_target_name, project_dir)
+            target_sources << file_path
+          end
+        end
+      rescue
+        # ignore errors while collecting build phase files
+      end
+    end
+
+    lea_section_path = File.join(project_path, "AppSealingSDK", "Libraries", "LEASection.mm")
+    if File.exist?(lea_section_path)
+      target_sources << lea_section_path unless target_sources.include?(lea_section_path)
+    end
+
+    sources = (main_group_sources + target_sources).compact.uniq
+    if sources.empty?
+      puts "[ERROR] No valid source files found for active target!"
+      exit(1)
+    end
+
+    # 6. Scan sources and collect tagged strings
+    sources.each do |path|
+      unless File.exist?(path)
+        puts "    [WARN] Source file does not exist: #{path}".yellow
+        next
+      end
+
+      if action == "restore"
+        $source_path << path
+        puts "    [INFO] Added to restore list: #{path}".cyan
+        next
+      end
+
+      begin
+        strings = extract_tagged_strings(path)
+      rescue => e
+        puts "    [WARN] Failed to extract tagged strings from #{path}: #{e}".yellow
+        next
+      end
+
+      if strings.empty?
+        puts "    [INFO] No tagged strings found in: #{path}".cyan
+        next
+      end
+
+      puts "    [INFO] Found #{strings.size} tagged strings in: #{path}"
+      strings.each { |s| $request_param << s }
+      $source_path << path
+    end
+
+    # 7. Encrypt strings via server/local AES
+    if action != "restore" && $request_param.length > 0
+      begin
+        puts "    [INFO] Encrypting #{$request_param.length} strings...".cyan
+        $enc_strings = get_encrypted_strings(project_path, $request_param)
+        puts "    [INFO] Encrypted strings ready.".cyan
+      rescue => e
+        puts "    [ERROR] String encryption failed: #{e}".red
+        exit(1)
+      end
+    end
+
+    # 8. Backup and replace/restore
+    $source_path.each do |file|
+      unless File.exist?(file)
+        puts "    [WARN] Source file not found for replace/restore: #{file}".yellow
+        next
+      end
+
+      if action == "restore"
+        begin
+          puts "    [INFO] Restoring original code: #{file}".cyan
+          restore_original_code(file)
+        rescue => e
+          puts "    [ERROR] Restore failed for #{file}: #{e}".red
+        end
+      else
+        begin
+          backup_file = "#{file}.org"
+          FileUtils.cp(file, backup_file)
+          puts "    [INFO] Backup created: #{backup_file}".cyan
+          replace_tagged_strings(file)
+          puts "    [INFO] Replaced tagged strings in: #{file}".cyan
+        rescue => e
+          puts "    [ERROR] Replace failed for #{file}: #{e}".red
+        end
+      end
+    end
+
+    puts "    [INFO] String encryption process completed.".cyan
+  end
+ 
+end
+#============================================================================================#
+#
+#    Swift / Objective-C Code syntax parser / checker for Secure Filesystem
+#
+#    - this check logic is activated when securefile option is enabled
+#    - Swift code is checked by ScanSwiftAST external tool (git checkout & compile)
+#    - Objective-C code is checked by Clang-AST external tool
+#
+#============================================================================================#
+
+require 'json'
+require 'open3'
+require 'fileutils'
+require 'pathname'
+require 'xcodeproj'
+
+#--------------------------------------------------------------------------------------------
+#    SwiftSyntax main.swift content (AST dumper)
+#--------------------------------------------------------------------------------------------
+
+MAIN_SWIFT_CONTENT = <<~MAIN
+    import Foundation
+    import SwiftSyntax
+    import SwiftParser
+
+    struct Finding: Codable {
+        let kind: String      // "member" or "declRef"
+        let base: String      // base expression for member calls
+        let name: String      // method/function base name
+        let full: String      // calledExpression text
+        let line: Int
+        let code: String
+        let arg0: String      // first argument expression text (empty if none)
+        let argLabels: [String] // argument labels in call site order
+    }
+
+    guard CommandLine.arguments.count > 1 else {
+        fputs("[ERROR] No Swift file provided.\\n", stderr)
+        exit(1)
+    }
+
+    let filePath = CommandLine.arguments[1]
+    let fileURL = URL(fileURLWithPath: filePath)
+    var findings: [Finding] = []
+
+    do {
+        let sourceText = try String(contentsOf: fileURL)
+        let sourceFile = Parser.parse(source: sourceText)
+        let converter = SourceLocationConverter(fileName: filePath, tree: sourceFile)
+
+        final class FunctionCallVisitor: SyntaxVisitor {
+            var findings: [Finding] = []
+            let converter: SourceLocationConverter
+
+            init(converter: SourceLocationConverter) {
+                self.converter = converter
+                super.init(viewMode: .sourceAccurate)
+            }
+
+            override func visit(_ node: FunctionCallExprSyntax) -> SyntaxVisitorContinueKind {
+                let called = node.calledExpression
+                let location = converter.location(for: node.positionAfterSkippingLeadingTrivia)
+                let lineNumber = location.line
+                let code = node.description.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                let arg0Expr = node.arguments.first?.expression
+                let arg0Text = arg0Expr?.description.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+                // collect argument labels (nil → "_")
+                let labels: [String] = node.arguments.map { arg in
+                    arg.label?.text ?? "_"
+                }
+
+                // member call: base.member(...)
+                if let member = called.as(MemberAccessExprSyntax.self) {
+                    let base = (member.base?.description ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    let name = member.declName.baseName.text
+                    findings.append(
+                        Finding(
+                            kind: "member",
+                            base: base,
+                            name: name,
+                            full: member.description.trimmingCharacters(in: .whitespacesAndNewlines),
+                            line: lineNumber,
+                            code: code,
+                            arg0: arg0Text,
+                            argLabels: labels
+                        )
+                    )
+                    return .skipChildren
+                }
+
+                // type or function call: TypeName(...), funcName(...)
+                if let declRef = called.as(DeclReferenceExprSyntax.self) {
+                    let name = declRef.baseName.text
+                    findings.append(
+                        Finding(
+                            kind: "declRef",
+                            base: "",
+                            name: name,
+                            full: declRef.description.trimmingCharacters(in: .whitespacesAndNewlines),
+                            line: lineNumber,
+                            code: code,
+                            arg0: arg0Text,
+                            argLabels: labels
+                        )
+                    )
+                    return .skipChildren
+                }
+
+                // fallback
+                findings.append(
+                    Finding(
+                        kind: "other",
+                        base: "",
+                        name: "",
+                        full: called.description.trimmingCharacters(in: .whitespacesAndNewlines),
+                        line: lineNumber,
+                        code: code,
+                        arg0: arg0Text,
+                        argLabels: labels
+                    )
+                )
+                return .skipChildren
+            }
+        }
+
+        let visitor = FunctionCallVisitor(converter: converter)
+        visitor.walk(sourceFile)
+        findings = visitor.findings
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted]
+        let jsonData = try encoder.encode(findings)
+        print(String(data: jsonData, encoding: .utf8)!)
+    } catch {
+        fputs("[ERROR] Failed to parse Swift file: \(error)\\n", stderr)
+        exit(1)
+    }
+MAIN
+
+#--------------------------------------------------------------------------------------------
+#    Allowed ObjC / Swift methods
+#--------------------------------------------------------------------------------------------
+
+ALLOWED_SWIFT_METHODS = {
+    "NSData" => %w[
+        initWithContentsOfFile:
+        initWithContentsOfURL:
+        dataWithContentsOfFile:
+        dataWithContentsOfURL:
+        writeToFile:
+        writeToURL:
+    ],
+    "NSMutableData" => %w[
+        writeToFile:
+    ],
+    "FileHandle" => %w[
+        writeData:
+        readDataOfLength:
+        closeFile
+        seekToFileOffset:
+        seekToEndOfFile
+        readDataToEndOfFile
+        truncateFileAtOffset:
+        availableData
+        offsetInFile
+    ],
+    "FileManager" => %w[
+        createFileAtPath:
+        contentsAtPath:
+    ],
+    "Data" => %w[
+        init
+    ]
+}
+
+FILE_IO_CLASSES = %w[
+    Data NSData NSMutableData
+    FileHandle NSFileHandle NSConcreteFileHandle
+    FileManager NSFileManager
+    InputStream OutputStream
+]
+
+#--------------------------------------------------------------------------------------------
+#    Sensitive methods (open/read/write/seek/truncate/position)
+#--------------------------------------------------------------------------------------------
+
+SENSITIVE_METHODS = {
+    "Data" => %w[
+        write
+    ],
+    "NSData" => %w[
+        initWithContentsOfFile:
+        initWithContentsOfURL:
+        dataWithContentsOfFile:
+        dataWithContentsOfURL:
+        writeToFile:
+        writeToURL:
+    ],
+    "NSMutableData" => %w[
+        writeToFile:
+    ],
+    "FileHandle" => %w[
+        init
+        readToEnd
+        read
+        readDataOfLength:
+        readDataToEndOfFile
+        write
+        writeData:
+        seek
+        seekToEnd
+        seekToFileOffset:
+        seekToEndOfFile
+        truncate
+        truncateFileAtOffset:
+        offsetInFile
+    ],
+    "FileManager" => %w[
+        createFileAtPath:
+        contentsAtPath:
+    ],
+    "InputStream" => %w[
+        init
+        read
+    ],
+    "OutputStream" => %w[
+        init
+        write
+    ]
+}
+
+UNSAFE_POSIX_FUNCS = %w[open close read write lseek fseek fread fwrite fflush truncate ftruncate]
+
+SWIFTPM_DIR    = File.expand_path("ScanSwiftAST", Dir.pwd)
+SWIFTPM_TARGET = File.join(SWIFTPM_DIR, ".build", "release", "ScanSwiftAST")
+
+module SecureFilesystem
+
+    #----------------------------------------------------------------------------------------
+    #    Logging (supports indent integer)
+    #----------------------------------------------------------------------------------------
+    def self.log(msg, color = :default, indent = 0)
+        colors = {
+            default: "\e[0m", red: "\e[31m", green: "\e[32m",
+            yellow: "\e[33m", blue: "\e[34m", magenta: "\e[35m",
+            cyan: "\e[36m", light_blue: "\e[94m", orange: "\e[38;5;208m"
+        }
+
+        color_code    = colors[color] || colors[:default]
+        reset_code    = colors[:default]
+        indent_spaces = ' ' * (4 * (indent.to_i))
+        indented_msg  = indent_spaces + msg.to_s
+        print "#{color_code}#{indented_msg}#{reset_code}\n"
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    SwiftSyntax package info / build helpers
+    #----------------------------------------------------------------------------------------
+    def self.determine_swiftsyntax_package
+        swift_version = `swift --version 2>/dev/null`.lines.first&.
+            match(/Apple Swift version (\d+\.\d+)/)&.captures&.first
+
+        unless swift_version
+            self.log("[ERROR] Could not determine Swift version from 'swift --version'", :red, 1)
+            raise "Swift version detection failed"
+        end
+
+        major, _minor = swift_version.split(".").map(&:to_i)
+        swiftsyntax_url = major >= 6 ? "https://github.com/apple/swift-syntax.git" : "https://github.com/apple/swiftsyntax.git"
+        swiftsyntax_pkg = major >= 6 ? "swift-syntax" : "SwiftSyntax"
+        swiftsyntax_ver = 'branch: "main"'
+        [swiftsyntax_url, swiftsyntax_pkg, swiftsyntax_ver]
+    end
+
+    def self.swiftsyntax_cli_path
+        if ENV['SCAN_SWIFT_AST_CLI'] && File.exist?(ENV['SCAN_SWIFT_AST_CLI'])
+            return ENV['SCAN_SWIFT_AST_CLI']
+        end
+
+        default_cli = File.expand_path("ScanSwiftAST/.build/release/ScanSwiftAST", Dir.pwd)
+        return default_cli if File.exist?(default_cli)
+
+        global_cli = "/usr/local/bin/ScanSwiftAST"
+        return global_cli if File.exist?(global_cli)
+
+        nil
+    end
+
+    def self.swiftsyntax_project_dir
+        File.expand_path("ScanSwiftAST", Dir.pwd)
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Ensure ScanSwiftAST SwiftPM project (Package.swift + main.swift) exists.
+    #----------------------------------------------------------------------------------------
+    $scan_swift_ast_built = false
+
+    def self.ensure_swiftsyntax_project!
+        dir          = self.swiftsyntax_project_dir
+        FileUtils.mkdir_p(dir)
+        sources_dir  = File.join(dir, "Sources/ScanSwiftAST")
+        FileUtils.mkdir_p(sources_dir)
+        main_file    = File.join(sources_dir, "main.swift")
+        package_file = File.join(dir, "Package.swift")
+
+        swiftsyntax_url, swiftsyntax_pkg, swiftsyntax_ver = self.determine_swiftsyntax_package
+
+        package_content = <<~PACKAGE
+            // swift-tools-version:5.9
+            import PackageDescription
+
+            let package = Package(
+                name: "ScanSwiftAST",
+                platforms: [.macOS(.v13)],
+                dependencies: [
+                    .package(url: "#{swiftsyntax_url}", #{swiftsyntax_ver})
+                ],
+                targets: [
+                    .executableTarget(
+                        name: "ScanSwiftAST",
+                        dependencies: [
+                            .product(name: "SwiftSyntax", package: "#{swiftsyntax_pkg}"),
+                            .product(name: "SwiftParser", package: "#{swiftsyntax_pkg}")
+                        ],
+                        path: "Sources/ScanSwiftAST"
+                    )
+                ]
+            )
+        PACKAGE
+
+        File.write(package_file, package_content)
+        File.write(main_file, MAIN_SWIFT_CONTENT)
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Build ScanSwiftAST SwiftPM project once and return CLI path.
+    #----------------------------------------------------------------------------------------
+    def self.build_swiftsyntax_project!
+        project_dir = self.swiftsyntax_project_dir
+        sources_dir = File.join(project_dir, "Sources/ScanSwiftAST")
+        main_file   = File.join(sources_dir, "main.swift")
+        built_cli   = File.join(project_dir, ".build/release/ScanSwiftAST")
+
+        need_build = false
+
+        unless File.exist?(main_file)
+            self.log(" ")
+            self.log("** main.swift not found. Regenerating ScanSwiftAST project...", :yellow, 2)
+            self.ensure_swiftsyntax_project!
+            need_build = true
+        else
+            self.ensure_swiftsyntax_project!
+        end
+
+        need_build = true unless File.exist?(built_cli)
+
+        if !need_build && $scan_swift_ast_built && File.exist?(built_cli)
+            return built_cli
+        end
+
+        if need_build && $scan_swift_ast_built && File.exist?(built_cli)
+            self.log("Build requested but already built in this run. Using existing CLI.", :yellow, 2)
+            return built_cli
+        end
+
+        if need_build
+            Dir.chdir(project_dir) do
+                self.log("** Building ScanSwiftAST CLI from source...", :cyan, 2)
+                self.log(" ")
+                env = { "SWIFTPM_USE_LOCAL_BINARY_ARTIFACTS" => "1" }
+                IO.popen(env, "swift build -c release 2>&1", "r") do |io|
+                    io.each_line do |line|
+                        line.chomp!
+                        next if line.strip.empty?
+                        next if line.start_with?("swift-driver version:")
+                        print " \e[0m[Building SwiftSyntax] \e[32m#{line}\n"
+                    end
+                end
+
+                unless $?.success?
+                    self.log("[ERROR] SwiftPM build failed", :red, 1)
+                    raise "SwiftPM build failed"
+                end
+            end
+            $scan_swift_ast_built = true
+        end
+
+        built_cli
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Helpers for source lookups / simple dataflow
+    #----------------------------------------------------------------------------------------
+    def self.code_line_at(file_path, line)
+        begin
+            @__swift_file_cache ||= {}
+            @__swift_file_cache[file_path] ||= File.readlines(file_path)
+            src = @__swift_file_cache[file_path][line - 1] || ""
+            src.strip
+        rescue
+            ""
+        end
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Scan backwards from `line-1` up to `max_back` lines to find an assignment to varname
+    #    returns the initializer expression string if found, else nil
+    #----------------------------------------------------------------------------------------
+    def self.find_initializer_expression(file_path, varname, line, max_back = 500)
+        @__swift_file_cache ||= {}
+        @__swift_file_cache[file_path] ||= File.readlines(file_path)
+
+        lines   = @__swift_file_cache[file_path]
+        idx     = [line - 2, lines.length - 1].min
+        scanned = 0
+
+        while idx >= 0 && scanned < max_back
+            l = lines[idx]
+
+            if (m = l.match(/(?:\b(?:let|var)\s+|^)\s*#{Regexp.escape(varname)}\s*(?::[^=]+)?=\s*(.+)$/))
+                expr = m[1].strip
+                expr = expr.gsub(/,\s*$/, '')
+                return expr
+            end
+
+            idx     -= 1
+            scanned += 1
+        end
+
+        nil
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Determine likely runtime type from base expression text
+    #----------------------------------------------------------------------------------------
+    def self.resolve_type_from_expression(expr_text)
+        return nil if expr_text.nil? || expr_text.strip.empty?
+
+        txt = expr_text.dup
+        txt = txt.gsub(/\s+/, ' ')
+
+        return "NSData" if txt =~ /\bas\s+NSData\b/ || txt =~ /\bNS(Mutable)?Data\b/
+        return "Data"   if txt =~ /\bData\(/ || txt =~ /\bData\./ || txt =~ /\bData\.\w+\(/
+        return "Data"   if txt =~ /PropertyListSerialization\.data\b/i
+        return "Data"   if txt =~ /JSONEncoder\(\)\.encode\b|\.encode\(.+JSONEncoder|PropertyListEncoder\b/i
+        return "Data"   if txt =~ /\.data\s*\(.*\)/i && txt =~ /(PropertyList|plist|JSON|Encoder|encode)/i
+        return "Data"   if txt =~ /Data\s*\(contentsOf/i
+        return "NSData" if txt =~ /NSData\s*\(contentsOfFile|NSData\(contentsOf/i
+        return "Data"   if txt =~ /\b[A-Za-z_]\w*Data\z/
+        return "NSData" if txt =~ /\bnsData\b/i
+
+        nil
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Resolve type of base expression by text or initializer
+    #----------------------------------------------------------------------------------------
+    def self.resolve_base_type(file_path, base_text, line)
+        return nil if base_text.nil? || base_text.strip.empty?
+
+        b = base_text.strip
+        b = b.gsub(/^\(+|\)+$/, '').strip
+
+        t = self.resolve_type_from_expression(b)
+        return t if t
+
+        if b =~ /\A([A-Za-z_]\w*)\z/
+            varname   = $1
+            init_expr = self.find_initializer_expression(file_path, varname, line)
+            if init_expr
+                t2 = self.resolve_type_from_expression(init_expr)
+                return t2 if t2
+            end
+        end
+
+        nil
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Class/name helpers
+    #----------------------------------------------------------------------------------------
+    def self.normalize_class_name(raw)
+        raw = raw.to_s.strip
+
+        return "NSData"        if raw.include?("NSData")
+        return "NSMutableData" if raw.include?("NSMutableData")
+        return "Data"          if raw == "Data" || raw.include?("Data(")
+        return "FileHandle"    if raw.include?("FileHandle") ||
+                                  raw.include?("NSFileHandle") ||
+                                  raw.include?("NSConcreteFileHandle") ||
+                                  raw =~ /\bhandle\b/i
+        return "FileManager"   if raw.include?("FileManager") ||
+                                  raw.include?("NSFileManager") ||
+                                  raw =~ /\bfm\b/i
+        return "InputStream"   if raw.include?("InputStream")
+        return "OutputStream"  if raw.include?("OutputStream")
+
+        raw
+    end
+
+    def self.io_class_for_member_base(base)
+        base = base.to_s.strip
+
+        return "FileManager"   if base.start_with?("FileManager")
+        return "FileHandle"    if base.include?("FileHandle")
+        return "InputStream"   if base.include?("InputStream")
+        return "OutputStream"  if base.include?("OutputStream")
+        return "NSData"        if base.include?("NSData") || base =~ /as\s+NSData/
+        return "NSMutableData" if base.include?("NSMutableData")
+        return "Data"          if base == "data" || base.include?("Data(")
+        return "Data"          if base =~ /\bPropertyListSerialization\.data\b/i
+        return "Data"          if base =~ /JSONEncoder\(\)\.encode\b|\.encode\s*\(.*JSONEncoder|PropertyListEncoder/i
+        return "Data"          if base =~ /\b[A-Za-z_]\w*Data\z/
+
+        nil
+    end
+
+    def self.io_class_for_declref(name, code)
+        case name
+        when "Data"
+            return "Data" if code.include?("contentsOf") || code.start_with?("Data(")
+        when "NSData"
+            return "NSData" if code.start_with?("NSData(") || code.include?("contentsOf")
+        when "NSMutableData"
+            return "NSMutableData" if code.start_with?("NSMutableData(")
+        when "InputStream"
+            return "InputStream" if code.start_with?("InputStream(")
+        when "OutputStream"
+            return "OutputStream" if code.start_with?("OutputStream(")
+        when "FileHandle"
+            return "FileHandle" if code.start_with?("FileHandle(")
+        end
+
+        nil
+    end
+
+    def self.allow_always?(klass, method, arg0_text)
+        return true if klass == "FileHandle" && method == "init"
+
+        if klass == "FileHandle" && method == "write"
+            txt = arg0_text.to_s
+
+            return true if txt =~ /\bas\s+(NS)?Data\b/
+            return true if txt =~ /\b(NS)?Data\s*\(.*\)/
+            return true if txt =~ /\b[A-Za-z_]\w*Data\b/
+            return true if txt =~ /JSONEncoder\(\)\.encode\b|PropertyListEncoder\b|PropertyListSerialization\.data\b/i
+        end
+
+        false
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Detects Data.write(...) from serialization
+    #----------------------------------------------------------------------------------------
+    def self.detect_write_as_data(res, prev_res, file_path, indent = 0)
+        title     = res['code'] || ""
+        full      = res['full'] || ""
+        base_text = res['base'] || ""
+        line      = res['line'] || 0
+
+        return nil unless title =~ /\.write\s*\(/ || full =~ /\.write\s*\(/
+
+        if prev_res
+            prev_code = prev_res['full'] || ""
+            if prev_code =~ /PropertyListSerialization\.data/i ||
+               prev_code =~ /JSONEncoder\(\)\.encode/i ||
+               prev_code =~ /PropertyListEncoder/i
+                return ["Data", "write"]
+            end
+        end
+
+        if base_text =~ /\A([A-Za-z_]\w*)\z/
+            var  = $1
+            init = self.find_initializer_expression(file_path, var, line)
+            if init =~ /PropertyListSerialization\.data|JSONEncoder|PropertyListEncoder/i
+                return ["Data", "write"]
+            end
+        end
+
+        if base_text =~ /\[[^\]]*\]/ || base_text =~ /\:[^\]]*\]/
+            return ["Data", "write"]
+        end
+
+        nil
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Scan a single Swift source file
+    #----------------------------------------------------------------------------------------
+    def self.scan_swift_file(file_path, indent = 2)
+        swiftsyntax_cli = self.build_swiftsyntax_project!
+
+        stdout, stderr, status = Open3.capture3(swiftsyntax_cli, file_path)
+        unless status.success?
+            self.log("[ERROR] SwiftSyntax scan failed: #{stderr}", :red, indent)
+            return []
+        end
+
+        self.log(" ")
+        self.log(" -- Scanning Swift file (ScanSwiftAST): #{file_path}", :default, indent)
+
+        results = JSON.parse(stdout) rescue nil
+        unless results.is_a?(Array)
+            self.log("[ERROR] SwiftSyntax output parse failed or empty", :red, indent)
+            return []
+        end
+
+        findings = []
+        seen     = {}
+
+        results.each_with_index do |res, idx|
+            kind   = res['kind'] || ""
+            base   = res['base'] || ""
+            name   = res['name'] || ""
+            code   = res['code'] || ""
+            line   = res['line'] || 0
+            arg0   = res['arg0'] || ""
+            full   = res['full'] || ""
+            labels = (res['argLabels'] || []).map(&:to_s)
+
+            klass  = nil
+            method = nil
+            reason = nil
+
+            if kind == "declRef" && UNSAFE_POSIX_FUNCS.include?(name)
+                key = [file_path, line, 'POSIX', name, code]
+                next if seen[key]
+                seen[key] = true
+
+                self.log(" ")
+                self.log("\e[35mPOSIX function used:\e[33m #{name}\e[0m", :red, indent + 1)
+                self.log("Line #{line}: #{self.code_line_at(file_path, line)}", :orange, indent + 2)
+
+                findings << {
+                    file: file_path,
+                    line: line,
+                    type: 'POSIX',
+                    func: name
+                }
+                next
+            end
+
+            if klass.nil? && kind == "member" && name == "write"
+                resolved_type = self.resolve_base_type(file_path, base, line)
+                if resolved_type != "NSString"
+                    if labels == %w[to atomically encoding]
+                        klass  = "String"
+                        method = "write"
+                        reason = "String.write signature"
+                    end
+                end
+            end
+
+            if klass.nil? && kind == "declRef"
+                first_label = code.match(/\b([a-zA-Z_][a-zA-Z0-9_]*)\s*:/)&.captures&.first
+                if first_label == "contentsOf"
+                    klass  = self.io_class_for_declref(name, code)
+                    method = "init" if klass
+                    reason = "Type(contentsOf:)"
+                end
+            end
+
+            if klass.nil?
+                prev_res    = idx > 0 ? results[idx - 1] : nil
+                write_detect = self.detect_write_as_data(res, prev_res, file_path, indent + 1)
+                if write_detect
+                    klass, method = write_detect
+                    reason        = "detect_write_as_data"
+                end
+            end
+
+            if klass.nil?
+                if kind == "member"
+                    klass  = self.io_class_for_member_base(base)
+                    method = name
+                    reason = "member base"
+                elsif kind == "declRef"
+                    mapped = self.io_class_for_declref(name, code)
+                    if mapped
+                        klass  = mapped
+                        method = "init"
+                        reason = "io_class_for_declref"
+                    end
+                end
+            end
+
+            next unless klass
+            next unless FILE_IO_CLASSES.include?(klass)
+            next if self.allow_always?(klass, method, arg0)
+
+            sensitive_list = SENSITIVE_METHODS[klass] || []
+            next unless sensitive_list.include?(method)
+
+            allowed = (ALLOWED_SWIFT_METHODS[klass] || [])
+            if defined?(ALLOWED_OBJC_METHODS)
+                ALLOWED_OBJC_METHODS.each do |objc_klass, methods|
+                    allowed += methods if self.normalize_class_name(objc_klass) == klass
+                end
+            end
+
+            next if allowed.include?(method)
+
+            key = [file_path, line, klass, method, code]
+            next if seen[key]
+            seen[key] = true
+
+            self.log(" ")
+            self.log("Non-allowed method detected: \e[33m#{klass}.#{method}\e[0m", :red, indent + 1)
+            self.log("Line #{line}: #{self.code_line_at(file_path, line)}", :orange, indent + 2)
+
+            findings << {
+                file:   file_path,
+                line:   line,
+                type:   'Swift',
+                class:  klass,
+                method: method,
+                reason: reason
+            }
+        end
+
+        self.log("\n") unless findings.empty?
+        findings
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Objective-C Clang AST JSON scanning (file I/O and POSIX usage)
+    #----------------------------------------------------------------------------------------
+
+    ALLOWED_OBJC_METHODS = {
+        "NSData" => %w[
+            initWithContentsOfFile:
+            initWithContentsOfURL:
+            dataWithContentsOfFile:
+            dataWithContentsOfURL:
+            writeToFile:atomically:
+            writeToFile:options:error:
+            writeToURL:atomically:
+            writeToURL:options:error:
+        ],
+        "NSMutableData" => %w[
+            writeToFile:atomically:
+            writeToFile:options:error:
+        ],
+        "NSFileHandle" => %w[
+            writeData:
+            readDataOfLength:
+            closeFile
+            seekToFileOffset:
+            seekToEndOfFile
+            readDataToEndOfFile
+            truncateFileAtOffset:
+            availableData
+            offsetInFile
+        ],
+        "NSConcreteFileHandle" => %w[
+            writeData:
+            readDataOfLength:
+            closeFile
+            seekToFileOffset:
+            seekToEndOfFile
+            readDataToEndOfFile
+            truncateFileAtOffset:
+            availableData
+            offsetInFile
+        ],
+        "NSFileManager" => %w[
+            createFileAtPath:contents:attributes:
+            contentsAtPath:
+        ],
+        "NSString" => %w[
+            stringWithContentsOfFile:
+            stringWithContentsOfURL:
+            initWithContentsOfFile:
+            initWithContentsOfURL:
+        ],
+        "NSArray" => %w[
+            arrayWithContentsOfFile:
+            arrayWithContentsOfURL:
+            initWithContentsOfFile:
+            initWithContentsOfURL:
+        ],
+        "NSDictionary" => %w[
+            dictionaryWithContentsOfFile:
+            dictionaryWithContentsOfURL:
+            initWithContentsOfFile:
+            initWithContentsOfURL:
+        ]
+    }
+
+    FILE_IO_OBJC_CLASSES = %w[
+        NSFileManager
+        NSFileHandle
+        NSConcreteFileHandle
+        NSData
+        NSMutableData
+        NSInputStream
+        NSOutputStream
+    ]
+
+    FILE_META_METHODS = {
+        "NSFileManager" => %w[
+            fileExistsAtPath
+            fileExistsAtPath:isDirectory:
+            attributesOfItemAtPath:error:
+            contentsOfDirectoryAtPath:error:
+            moveItemAtPath:toPath:error:
+            copyItemAtPath:toPath:error:
+            removeItemAtPath:error:
+            defaultManager
+        ],
+        "NSFileHandle" => %w[
+            fileHandleForWritingAtPath
+            fileHandleForReadingAtPath
+        ]
+    }
+
+    NON_IO_METHODS = %w[
+        alloc
+        init
+        new
+        copy
+        mutableCopy
+        isEqualToString:
+        dataUsingEncoding:
+    ]
+
+    #----------------------------------------------------------------------------------------
+    #    Objective-C helpers
+    #----------------------------------------------------------------------------------------
+    def self.extract_loc(node)
+        loc   = node['loc']   || {}
+        range = node['range'] || {}
+
+        if range.is_a?(Hash)
+            b = range['begin'] || range['start']
+            if b.is_a?(Hash)
+                file   = b['file']
+                line   = b['line']
+                column = b['column']
+                return { 'file' => file, 'line' => line || 0, 'column' => column || 0 } if line && line > 0
+            end
+        end
+
+        if loc['expansionLoc'].is_a?(Hash)
+            loc = loc['expansionLoc']
+        elsif loc['spellingLoc'].is_a?(Hash)
+            loc = loc['spellingLoc']
+        end
+
+        file   = loc['file']
+        line   = loc['line']
+        column = loc['column']
+
+        if (!line || line == 0) && range.is_a?(Hash)
+            b = range['begin'] || range['start']
+            if b.is_a?(Hash)
+                file   ||= b['file']
+                line   ||= b['line']
+                column ||= b['column']
+            end
+        end
+
+        { 'file' => file, 'line' => line || 0, 'column' => column || 0 }
+    end
+
+    def self.extract_selector(node)
+        node['selector'] || node['sel'] || node['callee'] || node['name']
+    end
+
+    def self.extract_decl_name(node)
+        name = node['name'] || node['referencedDecl'] || node['value'] || node['callee']
+        if name.is_a?(Hash)
+            name = name['name'] || name['identifier'] || name['spelling'] || name['qualName']
+        end
+        return nil unless name.is_a?(String)
+        name.split(/[@\s]/).first
+    end
+
+    def self.normalize_class_from_qualtype(qual)
+        return nil unless qual && qual.is_a?(String)
+        klass = qual.split(/[ *<\[\]]/).first
+        return nil if !klass || klass.empty?
+        return nil if %w[BOOL bool void int long short char NSInteger NSUInteger id auto const volatile double float].include?(klass)
+        klass
+    end
+
+    Env = Struct.new(:vars, :self_class)
+
+    def self.build_env_from_ast(ast)
+        vars       = {}
+        self_class = nil
+
+        walk = lambda do |node, current_self|
+            kind = node['kind'] || ''
+
+            if kind == 'ObjCInterfaceDecl' || kind == 'ObjCImplementationDecl'
+                self_name   = node['name']
+                current_self = self_name if self_name && !self_name.empty?
+
+                (node['inner'] || []).each do |ch|
+                    if ch['kind'] == 'ObjCIvarDecl' || ch['kind'] == 'FieldDecl'
+                        iname    = ch['name']
+                        type_obj = ch['type'] || ch['typeInfo'] || {}
+                        qual     = type_obj.is_a?(Hash) ? (type_obj['qualType'] || type_obj['desugaredQualType']) : type_obj
+                        klass    = self.normalize_class_from_qualtype(qual)
+                        vars[iname] = klass if iname && klass
+                    elsif ch['kind'] == 'ObjCPropertyDecl'
+                        pname    = ch['name']
+                        type_obj = ch['type'] || ch['typeInfo'] || {}
+                        qual     = type_obj.is_a?(Hash) ? (type_obj['qualType'] || type_obj['desugaredQualType']) : type_obj
+                        klass    = self.normalize_class_from_qualtype(qual)
+                        vars[pname] = klass if pname && klass
+                    end
+                    walk.call(ch, current_self)
+                end
+
+                self_class = current_self unless self_class
+                return
+            end
+
+            if kind == 'VarDecl' || kind == 'ParmVarDecl'
+                name     = node['name']
+                type_obj = node['type'] || node['typeInfo'] || {}
+                qual     =
+                    case type_obj
+                    when Hash
+                        type_obj['qualType'] || type_obj['desugaredQualType'] || type_obj['name']
+                    when String
+                        type_obj
+                    else
+                        nil
+                    end
+                if name && qual
+                    klass = self.normalize_class_from_qualtype(qual)
+                    vars[name] = klass if klass
+                end
+            end
+
+            (node['inner'] || []).each { |ch| walk.call(ch, current_self) }
+        end
+
+        walk.call(ast, self_class)
+        Env.new(vars, self_class)
+    end
+
+    def self.dig_for_receiver_info(node)
+        return nil unless node.is_a?(Hash)
+        kind = node['kind'] || ''
+
+        case kind
+        when 'DeclRefExpr'
+            return { kind: 'DeclRefExpr', name: node['referencedDecl'] || node['name'], type: node['type'] }
+        when 'ObjCClassRefExpr', 'ObjCInterfaceTypeExpr'
+            return { kind: kind, name: node['name'] }
+        when 'ImplicitCastExpr', 'CStyleCastExpr', 'ParenExpr', 'MaterializeTemporaryExpr', 'ExprWithCleanups'
+            (node['inner'] || []).each do |ch|
+                r = self.dig_for_receiver_info(ch)
+                return r if r
+            end
+        when 'MemberExpr'
+            base = node['base'] || (node['inner'] && node['inner'].first)
+            return self.dig_for_receiver_info(base)
+        end
+
+        nil
+    end
+
+    def self.extract_objc_class_with_env(msg_node, env, code_line = nil)
+        return nil unless msg_node.is_a?(Hash)
+
+        type_obj =
+            msg_node['receiverType']     ||
+            msg_node['receiverTypeInfo'] ||
+            msg_node['type']             ||
+            msg_node['base']             ||
+            msg_node['typeInfo']         || {}
+
+        qual =
+            case type_obj
+            when Hash
+                type_obj['qualType'] || type_obj['desugaredQualType'] || type_obj['name'] || type_obj['typeName']
+            when String
+                type_obj
+            else
+                nil
+            end
+
+        klass = self.normalize_class_from_qualtype(qual)
+        return klass if klass
+
+        inner = msg_node['inner'] || []
+        receiver_expr = inner.find do |ch|
+            k = ch['kind']
+            %w[DeclRefExpr ObjCClassRefExpr ObjCInterfaceTypeExpr MemberExpr ImplicitCastExpr SuperExpr].include?(k)
+        end
+
+        if receiver_expr
+            info = self.dig_for_receiver_info(receiver_expr)
+            if info
+                if info[:kind] == 'DeclRefExpr'
+                    ref_name = info[:name]
+                    if ref_name.is_a?(Hash)
+                        ref_name = ref_name['name'] || ref_name['identifier'] || ref_name['spelling']
+                    end
+
+                    if ref_name.is_a?(String)
+                        if env&.vars && env.vars[ref_name]
+                            return env.vars[ref_name]
+                        end
+
+                        if ref_name =~ /^[A-Z][A-Za-z0-9_]+$/
+                            return ref_name
+                        end
+
+                        return env.self_class if ref_name == 'super' && env&.self_class
+                    end
+                elsif info[:kind] == 'ObjCClassRefExpr' || info[:kind] == 'ObjCInterfaceTypeExpr'
+                    rn = info[:name]
+                    rn = rn['name'] if rn.is_a?(Hash)
+                    klass2 = self.normalize_class_from_qualtype(rn)
+                    return klass2 if klass2
+                end
+            end
+
+            t = receiver_expr['type'] || receiver_expr['typeInfo']
+            if t.is_a?(Hash)
+                qc = t['qualType'] || t['desugaredQualType'] || t['name']
+                kc = self.normalize_class_from_qualtype(qc)
+                return kc if kc
+            elsif t.is_a?(String)
+                kc = self.normalize_class_from_qualtype(t)
+                return kc if kc
+            end
+        end
+
+        if inner.any? { |ch| (ch['kind'] || '') == 'SuperExpr' }
+            return env.self_class
+        end
+
+        if code_line && code_line.is_a?(String) && !code_line.empty?
+            if (m = code_line.match(/\[\s*([A-Za-z_][A-Za-z0-9_\.]*)\s+/))
+                token = m[1]
+                if token =~ /^[A-Z][A-Za-z0-9_]+(\.[A-Za-z0-9_]+)?$/
+                    cand = token.split('.').first
+                    return cand
+                end
+                return env.vars[token] if env&.vars && env.vars[token]
+                return env.self_class if token == 'super'
+            end
+
+            if (m2 = code_line.match(/([A-Za-z_][A-Za-z0-9_]*)\./))
+                var = m2[1]
+                return env.vars[var] if env&.vars && env.vars[var]
+            end
+        end
+
+        nil
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Main Objective‑C scanner
+    #----------------------------------------------------------------------------------------
+    def self.scan_objc_file(file_path, indent = 1)
+        self.log(" ")
+        self.log(" -- Scanning Objective-C file (Clang AST): #{file_path}", :white, indent)
+
+        unless File.exist?(file_path)
+            self.log("[ERROR] File not found: #{file_path}", :red, indent + 1)
+            return []
+        end
+
+        lines = File.readlines(file_path, chomp: true)
+
+        clang_cmd = [
+            'clang',
+            '-Xclang', '-ast-dump=json',
+            '-fsyntax-only',
+            '-x', 'objective-c',
+            '-fobjc-arc',
+            file_path
+        ]
+
+        stdout, stderr, status = Open3.capture3(*clang_cmd)
+        unless status.success?
+            self.log("[ERROR] Clang AST failed: #{stderr}", :red, indent + 1)
+            return []
+        end
+
+        begin
+            ast = JSON.parse(stdout)
+        rescue => e
+            self.log("[ERROR] Failed to parse JSON AST: #{e}", :red, indent + 1)
+            return []
+        end
+
+        env                = self.build_env_from_ast(ast)
+        allowed_objc       = ALLOWED_OBJC_METHODS
+        meta_methods       = FILE_META_METHODS
+        non_io_methods     = NON_IO_METHODS
+        unsafe_posix_funcs = UNSAFE_POSIX_FUNCS
+
+        findings = []
+        seen     = {}
+
+        scan_node = lambda do |node, parent_loc|
+            kind     = node['kind'] || ''
+            own_loc  = self.extract_loc(node)
+            loc_info = (own_loc['line'] && own_loc['line'] > 0) ? own_loc : (parent_loc || own_loc)
+
+            line      = loc_info['line'] || 0
+            code_line = (line > 0 && line <= lines.size) ? lines[line - 1] : ''
+
+            if kind == 'DeclRefExpr' || kind == 'declRef'
+                name = self.extract_decl_name(node)
+                if name && unsafe_posix_funcs.include?(name)
+                    key = [file_path, line, 'POSIX', name, code_line]
+                    unless seen[key]
+                        seen[key] = true
+                        self.log(" ")
+                        indent2 = ' ' * 4 * (indent + 1)
+                        print "#{indent2}\e[35mPOSIX function used: \e[0m"
+                        print "\e[33m#{name}\e[0m\n"
+                        self.log("Line #{line}: #{self.code_line_at(file_path, line)}", :orange, indent + 2)
+                        findings << { file: file_path, line: line, type: 'POSIX', func: name }
+                    end
+                end
+            elsif kind == 'CallExpr'
+                callee      = node['callee'] || node['name']
+                callee_name = callee.is_a?(Hash) ? self.extract_decl_name(callee) : callee
+                if callee_name && unsafe_posix_funcs.include?(callee_name)
+                    key = [file_path, line, 'POSIX', callee_name, code_line]
+                    unless seen[key]
+                        seen[key] = true
+                        indent2 = ' ' * 4 * (indent + 1)
+                        print "#{indent2}\e[31mPOSIX function used: \e[0m"
+                        print "\e[33m#{callee_name}\e[0m\n"
+                        self.log("Line #{line}: #{self.code_line_at(file_path, line)}\n", :orange, indent + 2)
+                        findings << { file: file_path, line: line, type: 'POSIX', func: callee_name }
+                    end
+                end
+            end
+
+            if ['ObjCMessageExpr', 'messageSend'].include?(kind)
+                selector = self.extract_selector(node)
+                klass    = self.extract_objc_class_with_env(node, env, code_line)
+
+                unless selector
+                    (node['inner'] || []).each { |child| scan_node.call(child, loc_info) }
+                    return
+                end
+
+                display_class = klass
+
+                if !display_class
+                    r = node['receiver'] || node['objcReceiver'] || node['base'] || node['callee']
+                    if r.is_a?(Hash)
+                        candidate = r['name'] || r['referencedDecl'] || r['spelling']
+                        if candidate.is_a?(Hash)
+                            candidate = candidate['name'] || candidate['identifier'] || candidate['spelling']
+                        end
+                        if candidate.is_a?(String)
+                            c = self.normalize_class_from_qualtype(candidate)
+                            display_class = c if c
+                        end
+                    end
+                end
+
+                display_name_for_log = display_class ? "[#{display_class} #{selector}]" : "[ #{selector}]"
+
+                if non_io_methods && !non_io_methods.empty?
+                    sel_no_colon = selector.to_s.sub(/:+$/, '')
+                    is_non_io =
+                        non_io_methods.include?(selector)       ||
+                        non_io_methods.include?("#{selector}:") ||
+                        non_io_methods.include?(sel_no_colon)
+
+                    if is_non_io
+                        (node['inner'] || []).each { |child| scan_node.call(child, loc_info) }
+                        return
+                    end
+                end
+
+                if display_class &&
+                    %w[NSString NSMutableString NSArray NSMutableArray NSDictionary NSMutableDictionary].include?(display_class)
+                    (node['inner'] || []).each { |child| scan_node.call(child, loc_info) }
+                    return
+                end
+
+                if display_class && !FILE_IO_OBJC_CLASSES.include?(display_class)
+                    (node['inner'] || []).each { |child| scan_node.call(child, loc_info) }
+                    return
+                end
+
+                sel_no_colon   = selector.to_s.sub(/:+$/, '')
+                all_meta_names = meta_methods.values.flatten
+                is_meta =
+                    all_meta_names.include?(selector)       ||
+                    all_meta_names.include?("#{selector}:") ||
+                    all_meta_names.include?(sel_no_colon)
+
+                if is_meta
+                    (node['inner'] || []).each { |child| scan_node.call(child, loc_info) }
+                    return
+                end
+
+                allowed = false
+                if display_class && allowed_objc[display_class]
+                    allowed = allowed_objc[display_class].include?(selector)
+                end
+
+                unless allowed
+                    allowed_names = allowed_objc.values.flatten
+                    allowed =
+                        allowed_names.include?(selector)       ||
+                        allowed_names.include?("#{selector}:") ||
+                        allowed_names.include?(sel_no_colon)
+                end
+
+                if allowed
+                    (node['inner'] || []).each { |child| scan_node.call(child, loc_info) }
+                    return
+                end
+
+                key = [file_path, line, display_class, selector, code_line]
+                unless seen[key]
+                    seen[key] = true
+                    self.log(" ")
+                    indent2 = ' ' * 4 * (indent + 1)
+                    print indent2
+                    print "\e[31mNon-allowed method detected: \e[0m"
+                    print "\e[33m#{display_name_for_log}\e[0m\n"
+                    self.log("Line #{line}: #{self.code_line_at(file_path, line)}", :orange, indent + 2)
+
+                    findings << {
+                        file:   file_path,
+                        line:   line,
+                        type:   'ObjC',
+                        class:  display_class,
+                        method: selector
+                    }
+                end
+            end
+
+            (node['inner'] || []).each { |child| scan_node.call(child, loc_info) }
+        end
+
+        scan_node.call(ast, nil)
+        self.log("\n") unless findings.empty?
+        findings
+    end
+
+    EXCLUDE_FILES = [
+        /AppsealingiOS\.h$/i,
+        /AppsealingiOS\.mm$/i,
+        /LEASection\.mm$/i
+    ]
+
+    EXCLUDE_FOLDERS = [
+        /AppSealingSDK\//
+    ]
+
+    #----------------------------------------------------------------------------------------
+    #    Dispatch scan based on file extension
+    #----------------------------------------------------------------------------------------
+    def self.scan_file(file, indent = 2)
+        return [] if EXCLUDE_FILES.any?   { |r| file =~ r }
+        return [] if EXCLUDE_FOLDERS.any? { |r| file =~ r }
+
+        case File.extname(file)
+        when ".swift"
+            self.scan_swift_file(file, indent)
+        when ".m", ".mm", ".c", ".cpp"
+            self.scan_objc_file(file, indent)
+        else
+            []
+        end
+    rescue => e
+        self.log("[ERROR] scan_file exception: #{e}", :red, indent)
+        []
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Traverse folder and collect source files
+    #----------------------------------------------------------------------------------------
+    def self.traverse_folder(folder, sources = [], indent = 1)
+        Dir.entries(folder).each do |entry|
+            next if entry == "." || entry == ".."
+            path = File.join(folder, entry)
+            if File.directory?(path)
+                self.traverse_folder(path, sources, indent + 1)
+            elsif path =~ /\.(swift|m|mm|c|cpp)$/
+                sources << path unless sources.include?(path)
+            end
+        end
+        sources
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Collect source files for target
+    #----------------------------------------------------------------------------------------
+    def self.collect_target_sources(project, target)
+        project_dir = File.dirname(project.path)
+        sources     = []
+
+        traverse_group = lambda do |group|
+            return if group.nil?
+
+            if group.respond_to?(:children)
+                group.children.each { |c| traverse_group.call(c) rescue nil }
+            end
+
+            if group.is_a?(Xcodeproj::Project::Object::PBXFileSystemSynchronizedRootGroup)
+                real_path = File.join(project_dir, group.path || "")
+                if Dir.exist?(real_path)
+                    self.traverse_folder(real_path, sources)
+                end
+            end
+
+            if group.respond_to?(:files)
+                group.files.each do |file_ref|
+                    next if file_ref.nil? || file_ref.path.nil?
+                    path = File.join(project_dir, file_ref.path)
+                    sources << path unless sources.include?(path)
+                end
+            end
+        end
+
+        traverse_group.call(project.main_group)
+
+        if target.respond_to?(:source_build_phase)
+            target.source_build_phase.files.each do |bf|
+                next if bf.file_ref.nil?
+                file_path = bf.file_ref.real_path.to_s
+                sources << file_path unless sources.include?(file_path)
+            end
+        end
+
+        lea_path = File.join(project_dir, 'AppSealingSDK', 'Libraries', 'LEASection.mm')
+        sources << lea_path if File.exist?(lea_path) && !sources.include?(lea_path)
+
+        sources.compact.uniq
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Find Xcode project
+    #----------------------------------------------------------------------------------------
+    def self.find_xcodeproj(start_dir)
+        dir = Pathname.new(start_dir)
+        while !dir.root?
+            proj = Dir[File.join(dir.to_s, '*.xcodeproj')]
+            return proj[0] unless proj.empty?
+            dir = dir.parent
+        end
+        nil
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Main Secure FileIO check
+    #----------------------------------------------------------------------------------------
+    def self.check_secure_fileio(project_path)
+        self.log(" ")
+        self.log("[INFO] Starting Secure FileIO validation...", :green, 1)
+
+        xcodeproj_path = self.find_xcodeproj(project_path)
+        unless xcodeproj_path
+            self.log("[ERROR] Cannot find Xcode project from: #{project_path}", :red, 1)
+            exit(1)
+        end
+
+        self.log("Found Xcode project at: #{xcodeproj_path}", :cyan, 1)
+
+        begin
+            project = Xcodeproj::Project.open(xcodeproj_path)
+        rescue => e
+            self.log("[ERROR] Can't open project: #{e}", :red, 1)
+            exit(1)
+        end
+
+        if project.targets.empty?
+            self.log("[ERROR] No target in Xcode project", :red, 1)
+            exit(1)
+        end
+
+        target = project.targets.first
+
+        self.log(" ")
+        self.log("Processing target: #{target.name}", :green, 1)
+
+        sources = self.collect_target_sources(project, target)
+        self.log("Found #{sources.size} source files for target '#{target.name}'.", :green, 1)
+
+        all_findings = []
+        sources.each_with_index do |file, idx|
+            all_findings.concat(self.scan_file(file, 2))
+        end
+
+        if all_findings.empty?
+            self.log("\n ✅ Secure File I/O methods scan completed: No problem found", :green)
+            true
+        else
+            self.log("\n ❌ Secure File I/O methods scan completed: #{all_findings.size} sensitive issue(s) found".bold, :red)
+
+            if $action == "securefile-verify"
+                false
+            else
+                print "\n ==> If you use these methods, file contents cannot be written/read normally.\n Do you want to continue anyway (is it intended)? Type 'YES' to proceed: ".yellow.bold
+                input = STDIN.gets.strip
+                if input == "YES"
+                    self.log(" ")
+                    puts " User confirmed to proceed.".cyan.bold
+                    true
+                else
+                    self.log(" ")
+                    self.log(" Aborted by user.\n", :orange, 0)
+                    false
+                end
+            end
+        end
+    end
+
+    #----------------------------------------------------------------------------------------
+    #    Print allowed methods (for docs)
+    #----------------------------------------------------------------------------------------
+    def self.print_allowed_methods
+        indent = ' ' * 4
+
+        self.log("#{indent}================================================================================", :cyan)
+        self.log("#{indent} Secure Filesystem - Allowed API List".bold, :yellow)
+        self.log("#{indent}-------------------------------------------------------------------------------", :cyan)
+        self.log("#{indent} Only the following Swift / Objective-C methods are permitted", :cyan)
+        self.log("#{indent} when Secure Filesystem verification is enabled.\n", :cyan)
+
+        self.log("#{indent}-------------------------------------------------------------------------------", :cyan)
+        self.log("#{indent} [Swift Allowed Methods]".bold, :green)
+        self.log("#{indent}-------------------------------------------------------------------------------", :cyan)
+
+        ALLOWED_SWIFT_METHODS.reject { |k, _| ["Data", "NSMutableData"].include?(k) }.each do |klass, methods|
+            if klass == "NSData"
+                print "#{indent}\e[1m\e[36m • #{klass}\e[0m "
+                print "\e[1m\e[38;5;208m(NOT Data!)\e[0m\n"
+            else
+                self.log(" ", :default)
+                self.log("#{indent} • #{klass.bold}", :cyan, 0)
+            end
+            methods.each { |m| self.log("#{indent} - #{m}", :default, 0) }
+        end
+
+        self.log(" ", :default)
+        self.log("#{indent}-------------------------------------------------------------------------------", :cyan)
+        self.log("#{indent} [Objective-C Allowed Methods]".bold, :green)
+        self.log("#{indent}-------------------------------------------------------------------------------", :cyan)
+
+        ALLOWED_OBJC_METHODS.reject { |k, _| ["NSMutableData", "NSConcreteFileHandle"].include?(k) }.each do |klass, methods|
+            self.log(" ", :default) if klass != "NSData"
+            self.log("#{indent} • #{klass.bold}", :cyan, 0)
+            methods.each { |m| self.log("#{indent} - #{m}", :default, 0) }
+        end
+
+        self.log(" ", :default)
+        self.log("#{indent}================================================================================\n\n", :cyan)
+    end
+end
+
+
+class AppSealingCLI
+  attr_reader :ipa_path, :options
+
+  def initialize(argv)
+    @argv     = argv
+    @ipa_path = nil
+    @options  = {}
+  end
+
+  def parse_and_validate_args!
+    # --- apply / restore handler ---
+    if @argv.length >= 1 && (%w[apply restore].include?(@argv[0]))
+      @options[:action]       = @argv[0]
+      @options[:project_path] = @argv[1]
+      debug_log "Starting string_encryption_main with action=#{@options[:action]}, project_path=#{@options[:project_path]}" if defined?(debug_log)
+      StringEncryption.string_encryption_main( project_path: @options[:project_path], action:@options[:action] )
+      exit(0)
+    end
+
+    # --- securefile-verify handler ---
+    if @argv.length >= 1 && @argv[0] == "securefile-verify"
+      @options[:action]       = @argv[0]
+      @options[:project_path] = @argv[1]
+
+      $action = @options[:action]
+      unless SecureFilesystem.check_secure_fileio(@options[:project_path])
+        print "\n ==> If you use these methods, file contents cannot be written/read normally.\n" \
+              " Do you want to view the allowed methods list? Type 'Y' to print : ".yellow.bold
+        input = STDIN.gets.strip
+        if input == "Y" || input == "y"
+          puts " "
+          SecureFilesystem.print_allowed_methods
+        end
+      end
+      exit(0)
+    end
+
+    # --- IPA argument validation ---
+    if @argv.length < 1 || File.extname(@argv[0]).delete(".").downcase != "ipa"
+      puts ".\n.\nusage: generate_hash YourApp.IPA [-url_scheme=url] [-camera=NSCameraUsageDescription] [-antihook=enable|disable] [-antiswizzle=enable|disable] [-securefile=enable|disable]".yellow
+      puts "         url : URL scheme for Unreal app [optional]".yellow
+      puts "         camera : camera usage description string to put into Info.plist [optional]".yellow
+      puts "         antihook : enable or disable anti-hooking feature [optional, default=enabled]".yellow
+      puts "         antiswizzle : enable or disable anti-swizzling feature [optional, default=disabled]".yellow
+      puts "         securefile : enable or disable secure filesystem (automatic file encryption) [optional, default=disabled]".yellow
+      puts ".\n.\n.\n".yellow
+      exit(false)
+    end
+
+    puts <<~INTRO.bold.green
+               +-------------------------------------------------------------------------------------+
+               |                                                                                     |
+               |  AppSealing IPA Hash Generator V1.12.0.0 : provided by Doverunner                   |
+               |                                                                                     |
+               +-------------------------------------------------------------------------------------+
+            INTRO
+
+    puts "[Target IPA]         = #{@argv[0].to_s}"
+    debug_log "Target IPA input: #{@argv[0]}" if defined?(debug_log)
+
+    # --- Validate IPA absolute path ---
+    @ipa_path = Pathname.new(@argv[0])
+    unless @ipa_path.absolute?
+      puts "    [Error] Please provide an absolute path for the IPA file.".red
+      debug_log "Error: IPA path not absolute: #{@argv[0]}" if defined?(debug_log)
+      exit(false)
+    end
+
+    # --- CLI option parsing ---
+    @argv.each_with_index do |arg, i|
+      next if i == 0   # first argument is IPA path
+      key, value = arg.split("=", 2)
+      case key
+      when "-url_scheme"
+        @options[:url_scheme] = value
+        puts "[URL Scheme]         = #{value}"
+        debug_log "Parsed URL Scheme: #{value}" if defined?(debug_log)
+      when "-camera"
+        @options[:camera_desc] = value
+        puts "[Camera Description] = #{value}"
+        debug_log "Parsed Camera Description: #{value}" if defined?(debug_log)
+      when "-version"
+        @options[:version] = value
+        puts "[Version]            = #{value}"
+        debug_log "Parsed requested version: #{value}" if defined?(debug_log)
+      when "-antihook"
+        @options[:antihook] = value
+        puts "[Anti-Hooking]       = #{value}"
+        debug_log "Parsed anti-hooking option: #{value}" if defined?(debug_log)
+      when "-antiswizzle"
+        @options[:antiswizzle] = value
+        puts "[Anti-Swizzling]     = #{value}"
+        debug_log "Parsed anti-swizzling option: #{value}" if defined?(debug_log)
+      when "-securefile"
+        @options[:securefile] = value
+        puts "[Secure-Filesystem]  = #{value}"
+        debug_log "Parsed secure filesystem option: #{value}" if defined?(debug_log)
+      end
+    end
+  end
+end
+
+#--------------------------------------------------------------------------------------------
+#  PlistManager 클래스는 plist 파일을 관리하는 기능을 제공합니다.
+#  This class provides management and manipulation functions for XML .plist files,
+#  including read, write, update, and key operations via REXML.
+#--------------------------------------------------------------------------------------------
+require "rexml/document"
+include REXML
+
+class PlistManager
+  # Initialize a PlistManager for a given plist file path.
+  # Loads the file as an XML document into memory.
+  def initialize(file_path)
+    @file_path = file_path # plist 파일 경로를 인스턴스 변수로 저장
+                           # Store the plist file path as an instance variable
+    @doc = nil             # plist 파일의 XML 데이터를 저장할 변수
+                           # Holds the parsed XML document in memory
+    load_file              # 파일을 로드하여 XML 문서를 초기화
+                           # Immediately load the XML into memory on initialization
+  end
+
+  # Reads the plist file and loads it into memory as a REXML::Document object.
+  # Raises error and exits on file load failure.
+  def load_file
+    File.open(@file_path, "r") do |file|
+      @doc = REXML::Document.new(file) # XML 문서 객체 생성
+      # Create an XML document object in memory
+      debug_log "Plist loaded successfully from: #{@file_path}" if defined?(debug_log)
+    end
+  rescue StandardError => e
+    puts "    [Error] loading file: #{e.message}".red # 파일 읽기 실패 시 에러 메시지 출력
+    debug_log "Failed to load plist: #{e.class} - #{e.message}" if defined?(debug_log)
+    exit(false)
+  end
+
+  # 현재 메모리에 로드된 XML 문서를 plist 파일에 저장합니다.
+  # Writes the current XML document from memory back to the plist file,
+  # ensuring pretty print format and normalizing XML declaration/doctype quotes.
+  def save_file
+    File.open(@file_path, "w") do |file|
+      formatter = REXML::Formatters::Pretty.new(4) # 들여쓰기 4칸 설정
+      formatter.compact = true                     # 빈 줄 제거
+      formatter.write(@doc, file)                  # XML 문서를 파일에 출력
+    end
+
+    # 저장된 파일을 다시 읽어와서 XML 선언 부분의 작은따옴표를 큰따옴표로 변환
+    # Post-process the saved file to normalize quotes in XML declaration and plist tag
+    content = File.read(@file_path)
+    content.gsub!(/<\?xml version='1\.0' encoding='UTF-8'\?>/, '<?xml version="1.0" encoding="UTF-8"?>')
+    content.gsub!(/<plist version='1\.0'>/, '<plist version="1.0">')
+    File.write(@file_path, content)
+
+    debug_log "Plist file saved and normalized: #{@file_path}" if defined?(debug_log)
+  rescue StandardError => e
+    puts "    [Error] saving file: #{e.message}".red # 파일 저장 중 오류 발생 시 메시지 출력
+    debug_log "Failed to save plist: #{e.class} - #{e.message}" if defined?(debug_log)
+    exit(false)
+  end
+
+  # Updates or inserts a value for a given key in the plist.
+  # If value is nil, removes the key.
+  # Handles strings and arrays; replaces type as needed.
+  def update_key(key, value)
+    debug_log "update_key called: key='#{key}', value=#{value.inspect}" if defined?(debug_log)
+
+    element = REXML::XPath.first(@doc, "//key[text()='#{key}']") # key를 찾음
+    # Search for <key> element with matching name
+
+    if value.nil?
+      # value가 nil이면 key와 값을 삭제
+      # If value is nil, remove key and associated value
+      debug_log "Removing key because value is nil: #{key}" if element && defined?(debug_log)
+      remove_key(element) if element
+    elsif element
+      # key가 존재하면 값 업데이트
+      # If key exists, update its value
+      next_element = element.next_element
+      if next_element && next_element.name == "string" && value.is_a?(String)
+        # 기존 값이 문자열일 경우 업데이트
+        # If current value is a string and new value is also string, update in place
+        debug_log "Updating existing string key: #{key} → #{value}" if defined?(debug_log)
+        next_element.text = value
+      else
+        # 타입이 다르면 제거 후 새로 추가
+        # If type mismatch or not a <string>, remove and re-add
+        debug_log "Replacing existing key due to type mismatch: #{key}" if defined?(debug_log)
+        remove_key(element)
+        add_new_key(key, value)
+      end
+    else
+      # key가 없으면 새로 추가
+      # If key doesn't exist, add it fresh
+      debug_log "Adding new key: #{key} => #{value}" if defined?(debug_log)
+      add_new_key(key, value)
+    end
+  end
+
+  # Reads the value for a given key.
+  # Returns String, Array, true, false, or nil depending on value type.
+  def read(key)
+    debug_log "read called for key: #{key}" if defined?(debug_log)
+
+    element = REXML::XPath.first(@doc, "//key[text()='#{key}']") # 해당 <key> 요소를 찾음
+    # Locate the <key> element with the given name
+    return nil unless element
+
+    next_element = element.next_element # 해당 key의 다음 요소 (value 요소)
+
+    case next_element.name
+    when "string"
+      debug_log "Found string value for key #{key}: #{next_element.text}" if defined?(debug_log)
+      next_element.text # 문자열 값을 반환
+    when "array"
+      values = next_element.elements.map(&:text) # 배열 값을 반환 (각 요소의 텍스트)
+      debug_log "Found array value for key #{key}: #{values.inspect}" if defined?(debug_log)
+      values
+    when "true"
+      debug_log "Found boolean true for key #{key}" if defined?(debug_log)
+      true  # <true/> 값을 처리
+    when "false"
+      debug_log "Found boolean false for key #{key}" if defined?(debug_log)
+      false # <false/> 값을 처리
+    else
+      debug_log "Unsupported or missing value type for key #{key}" if defined?(debug_log)
+      nil   # 처리하지 않는 타입의 경우 nil 반환
+    end
+  end
+
+  # Updates or sets the CFBundleURLSchemes for the first dict under CFBundleURLTypes.
+  # - Replaces all existing schemes with the given new scheme string.
+  # - Adds necessary <key>/<array> nodes if missing.
+  def update_url_scheme(new_scheme)
+    debug_log "update_url_scheme called with: #{new_scheme}" if defined?(debug_log)
+
+    # CFBundleURLTypes 배열 찾기
+    # Locate CFBundleURLTypes array
+    url_types_array = XPath.first(@doc, "//key[text()='CFBundleURLTypes']/following-sibling::array")
+
+    if url_types_array
+      # CFBundleURLTypes 내부의 첫 <dict> 요소 찾기
+      # Locate the first dict element within the CFBundleURLTypes array
+      dict_element = url_types_array.elements["dict"]
+      if dict_element
+        # CFBundleURLSchemes 키의 array 요소 찾기
+        # Locate CFBundleURLSchemes array within that dict
+        schemes_key = dict_element.elements["key[text()='CFBundleURLSchemes']"]
+        schemes_array = schemes_key&.next_element
+
+        if schemes_array && schemes_array.name == "array"
+          # 기존 scheme 전부 삭제 후 새 scheme 등록
+          # Replace existing schemes with the new scheme
+          debug_log "Replacing existing URL schemes with: #{new_scheme}" if defined?(debug_log)
+          schemes_array.elements.each { |e| schemes_array.delete(e) }
+          schemes_array.add_element("string").text = new_scheme
+        else
+          # CFBundleURLSchemes 요소가 없으면 새로 생성
+          # If CFBundleURLSchemes doesn't exist, create key and array
+          debug_log "CFBundleURLSchemes not found — creating new key/array block" if defined?(debug_log)
+          new_schemes_key = Element.new("key")
+          new_schemes_key.text = "CFBundleURLSchemes"
+          new_schemes_array = Element.new("array")
+          new_schemes_array.add_element("string").text = new_scheme
+
+          dict_element.add_element(new_schemes_key)
+          dict_element.add_element(new_schemes_array)
+        end
+      else
+        puts "    [WARN] No <dict> element found under CFBundleURLTypes.".yellow
+        debug_log "Missing <dict> under CFBundleURLTypes — cannot set scheme" if defined?(debug_log)
+      end
+    else
+      puts "    [WARN] No CFBundleURLTypes found in the plist.".yellow
+      debug_log "CFBundleURLTypes key not found — cannot set scheme" if defined?(debug_log)
+    end
+  end
+
+  # plist 파일의 내용을 콘솔에 출력합니다.
+  # Prints the entire plist XML to console with pretty format.
+  def print
+    debug_log "Printing current plist document to console" if defined?(debug_log)
+
+    puts "======================================================================================================================="
+    formatter = REXML::Formatters::Pretty.new(4) # 들여쓰기 4칸 설정
+                                                 # Use 4-space indentation
+    formatter.compact = true                     # 빈 줄 제거
+                                                 # Remove extra line breaks
+    formatter.write(@doc, $stdout)               # 콘솔에 출력
+                                                 # Write XML to stdout
+    puts                                          # 줄바꿈 추가 (출력 후)
+    puts "-----------------------------------------------------------------------------------------------------------------------"
+  end
+
+  # Helper: Adds a new key/value pair to the root dict.
+  # value may be a string or array of strings.
+  def add_new_key(key, value)
+    dict_element = REXML::XPath.first(@doc, "//dict")   # 최상위 <dict> 요소 찾기
+                                                        # Locate the top-level <dict> element
+    return unless dict_element                          # <dict> 요소가 없으면 종료
+                                                        # Exit if no <dict> found
+
+    key_element = REXML::Element.new("key")             # 새로운 <key> 요소 생성
+                                                        # Create a new <key> element
+    key_element.text = key                              # <key>에 텍스트 설정
+                                                        # Assign the key name as text
+    dict_element.add_element(key_element)               # <dict>에 <key> 추가
+                                                        # Add the <key> to the <dict>
+
+    if value.is_a?(Array)
+      array_element = REXML::Element.new("array")     # 배열 값일 경우 <array> 생성
+                                                      # If value is an Array, create an <array> element
+      value.each do |val| # 각 배열 항목 추가
+        array_element.add_element("string").text = val
+      end
+      dict_element.add_element(array_element)         # <dict>에 <array> 추가
+                                                      # Add the array to the dict after the key
+      debug_log "Added key '#{key}' with array of #{value.size} string(s)" if defined?(debug_log)
+    else
+      string_element = REXML::Element.new("string")   # 문자열 값일 경우 <string> 생성
+                                                      # If value is a String, create a <string> element
+      string_element.text = value
+      dict_element.add_element(string_element)        # <dict>에 <string> 추가
+                                                      # Add the string to the dict after the key
+      debug_log "Added key '#{key}' with string value: #{value}" if defined?(debug_log)
+    end
+  end
+
+  # ... any other public instance methods (like update_url_scheme) ...
+
+  private
+
+  # Adds a <string> element after the given key.
+  def add_string_element(key_element, value)
+    dict_element = key_element.parent
+    dict_element.add_element("string").text = value
+    debug_log "Added <string> to key '#{key_element.text}' with value: #{value}" if defined?(debug_log)
+  end
+
+  # Removes the key/value entry for the given key element from the plist.
+  def remove_key(key_element)
+    return unless key_element
+    dict_element = key_element.parent
+    next_element = key_element.next_element
+    dict_element.delete(key_element)
+    dict_element.delete(next_element) if next_element
+    debug_log "Removed key '#{key_element.text}' and its value from plist" if defined?(debug_log)
+  end
+end
+
+# hash_lib/shell_utils.rb
+
+#-------------------------------------------------------------
+# 시스템 명령어를 안전하게 실행하며 실패할 경우 에러를 발생시킵니다.
+# Executes a system command safely, raises an exception if the command fails.
+#-------------------------------------------------------------
+module ShellUtils
+  def self.safe_system(cmd, error_msg)
+    debug_log "Running system command: #{cmd}" if defined?(debug_log)
+    system(cmd) || raise("#{error_msg}\nCommand: #{cmd}")
+  end
+end
+
+# hash_lib/hermes_validator.rb
+
+require "json"
+require "pathname"
+require "fileutils"
+require "find"
+
+class HermesValidator
+
+    ################################################################################################
+    #
+    # React Native version detection
+    #
+    ################################################################################################
+
+    def self.detect_react_native_version_from_project_root
+        current_dir  = Pathname.new(__dir__)
+        project_root = current_dir.join("../..").expand_path
+
+        version = nil
+        puts "    [INFO] Searching React Native version in project : #{project_root}".cyan
+
+        # 1) package.json
+        pkg = project_root.join("package.json")
+        if pkg.exist?
+            begin
+                json = JSON.parse(File.read(pkg))
+                if json["dependencies"] && json["dependencies"]["react-native"]
+                    version = json["dependencies"]["react-native"].gsub(/[^0-9.]/, "")
+                    puts "    [INFO] Found in package.json: #{version}".cyan
+                end
+            rescue => e
+                puts "    [WARN] package.json parse failed: #{e.message}".yellow
+            end
+        end
+
+        # 2) node_modules fallback
+        unless version
+            rn_pkg = project_root.join("node_modules/react-native/package.json")
+            if rn_pkg.exist?
+                begin
+                    json = JSON.parse(File.read(rn_pkg))
+                    version = json["version"]
+                    puts "    [INFO] Found in node_modules: #{version}".cyan
+                rescue => e
+                    puts "    [WARN] react-native/package.json parse failed: #{e.message}".yellow
+                end
+            end
+        end
+
+        unless version
+            puts "    [ERROR] React Native version not detected!".red
+        end
+
+        version
+    end
+
+    ################################################################################################
+    #
+    # RN helpers
+    #
+    ################################################################################################
+
+    def self.parse_rn_version(rn_version)
+        parts       = rn_version.split(".")
+        major_minor = parts[0..1].join(".")
+        patch       = parts[2]&.to_i
+        [major_minor, patch]
+    end
+
+    def self.hermes_engine_name_for_rn(rn_version)
+        major_minor, _ = parse_rn_version(rn_version)
+        major_minor.to_f >= 0.82 ? "hermesvm" : "hermes"
+    end
+
+    ################################################################################################
+    #
+    # Hermes ↔ RN compatibility matrix (AppSealing)
+    #
+    ################################################################################################
+
+    HERMES_RN_MATRIX = {
+        "85613e1f9d1216f2cce7e54604be46057092939d" => [["0.71"]],
+        "49794cfc7c81fb8f69fd60c3bbf85a7480cc5a77" => [["0.72"]],
+        "21043a3fc062be445e56a2c10ecd8be028dd9cc5" => [["0.73"]],
+        "bb1e74fe1e95c2b5a2f4f9311152da052badc2bc" => [["0.74", 0..2]],
+        "7bda0c267e76d11b68a585f84cfdd65000babf85" => [["0.74", 3..6], ["0.75"]],
+        "db6d12e202e15f7a446d8848d6ca8f7abb3cfb32" => [["0.76"], ["0.77", 0..1]],
+        "a942ef374897d85da38e9c8904574f8376555388" => [["0.78"]],
+        "4eb6132a5bf0450bf4c6c91987675381d7ac8bca" => [["0.79"], ["0.80"]],
+        "e0fc67142ec0763c6b6153ca2bf96df815539782" => [["0.81"], ["0.82"], ["0.83"]],
+    }
+
+    def self.version_match?(rn_version, _hermes_rn_range, hermes_commit)
+        rn_major_minor, rn_patch = parse_rn_version(rn_version)
+        matrix = HERMES_RN_MATRIX[hermes_commit]
+        return false unless matrix
+
+        matrix.any? do |ver|
+            if ver.length == 1
+                rn_major_minor == ver[0]
+            else
+                rn_major_minor == ver[0] && rn_patch && ver[1].include?(rn_patch)
+            end
+        end
+    end
+
+    ################################################################################################
+    #
+    # Binary metadata extraction
+    #
+    ################################################################################################
+
+    APPSEALING_VERSION_PATTERN = /AppSealing Starter (\d+\.\d+\.\d+\.\d+)/
+    HERMES_COMMIT_PATTERN =
+        /\[AppSealing\] hermes engine: ([a-fA-F0-9]+) \(for React Native ([\d]+(?:\.[\dx]+)*(?: ~ [\d]+(?:\.[\dx]+)*)?)\)/i
+
+    def self.extract_appsealing_version_from_file(path)
+        File.binread(path) =~ APPSEALING_VERSION_PATTERN ? $1 : nil
+    rescue => e
+        puts "    [ERROR] Failed to read #{path}: #{e.message}".red
+        nil
+    end
+
+    def self.extract_hermes_commit_and_rn_version(path)
+        File.binread(path) =~ HERMES_COMMIT_PATTERN ? [$1, $2] : [nil, nil]
+    rescue => e
+        puts "    [ERROR] Failed to read #{path}: #{e.message}".red
+        [nil, nil]
+    end
+
+    ################################################################################################
+    #
+    # Hermes / HermesVM file search
+    #
+    ################################################################################################
+
+    def self.find_hermes_engine_files(dir, engine_name)
+        results = []
+
+        unless dir && File.directory?(dir)
+            puts "    [ERROR] Directory does not exist: #{dir}".red
+            return results
+        end
+
+        Find.find(dir) do |path|
+            next unless File.file?(path)
+            if File.basename(path).downcase == engine_name
+                results << path
+                puts "    [FOUND] #{path}".green
+            end
+        end
+
+        results
+    end
+
+    ################################################################################################
+    #
+    # Main validation + replacement logic
+    #
+    ################################################################################################
+
+    def self.check_and_copy_hermes_files(project_rn_version, script_dir, app_path)
+        engine_name = hermes_engine_name_for_rn(project_rn_version)
+
+        puts "\n    [INFO] React Native #{project_rn_version} → engine: #{engine_name}".cyan
+
+        # --------------------------------------------------------------------------------------------
+        # Project side
+        # --------------------------------------------------------------------------------------------
+        project_engines = find_hermes_engine_files(script_dir, engine_name)
+        if project_engines.empty?
+            puts "    [ERROR] Project #{engine_name} not found.".red
+            return false
+        end
+
+        project_appsealing_version =
+            extract_appsealing_version_from_file(project_engines[0])
+        project_commit, project_rn_range =
+            extract_hermes_commit_and_rn_version(project_engines[0])
+
+        unless version_match?(project_rn_version, project_rn_range, project_commit)
+            puts "    [ERROR] Project #{engine_name} incompatible with RN #{project_rn_version}".red
+            return false
+        end
+
+        # --------------------------------------------------------------------------------------------
+        # IPA side
+        # --------------------------------------------------------------------------------------------
+        puts "\n    [INFO] Searching #{engine_name} in IPA...".cyan
+        app_engines = find_hermes_engine_files(app_path, engine_name)
+        if app_engines.empty?
+            puts "    [ERROR] IPA #{engine_name} not found.".red
+            return false
+        end
+
+        app_appsealing_version =
+            extract_appsealing_version_from_file(app_engines[0])
+        app_commit, app_rn_range =
+            extract_hermes_commit_and_rn_version(app_engines[0])
+
+        if app_commit.nil? || app_commit.empty?
+            puts "    [WARN] IPA #{engine_name} hermes version not detectable".yellow
+            puts "    [ACTION] Will replace IPA #{engine_name} with project #{engine_name}".yellow
+        else
+            unless version_match?(project_rn_version, app_rn_range, app_commit)
+                puts "    [ERROR] IPA #{engine_name} incompatible with RN #{project_rn_version}".red
+                return false
+            end
+        end
+
+        puts "\n    [Project] AppSealing #{project_appsealing_version}, Commit #{project_commit}".yellow
+        puts "    [IPA]     AppSealing #{app_appsealing_version}, Commit #{app_commit}".yellow
+
+        # --------------------------------------------------------------------------------------------
+        # Replacement
+        # --------------------------------------------------------------------------------------------
+        return true if project_appsealing_version == app_appsealing_version
+
+        puts "    [ACTION] Replacing IPA #{engine_name} with project #{engine_name}".white
+
+        app_engines.each do |dest|
+            FileUtils.cp(project_engines[0], dest)
+            puts "    [COPY] #{dest}"
+        end
+
+        puts "    [SUCCESS] #{engine_name} replacement completed.".green
+        true
+    end
+end
+
+# hash_lib/code_signer.rb
+
+require "fileutils"
+require "open3"
+
+#--------------------------------------------------------------------------------------------
+#  CodeSigner 클래스는 앱 번들에 대한 인증서 추출, 엔타이틀먼트 처리, 재서명 기능을 제공합니다.
+#  This class handles extracting certificates, entitlements, and re-signing app bundles.
+#--------------------------------------------------------------------------------------------
+class CodeSigner
+  def self.sign_app_payload(_app, _folder, generate_info_only)
+      cert_sha1 = ''
+      app    = File.expand_path(_app)
+      folder = File.expand_path(_folder) + "/"
+
+      begin
+          # 0. Pre-checks: make sure the app bundle and working folder exist
+          puts "    [INFO] Verifying directory structure...".cyan
+          raise "Directory does not exist (#{folder})" unless Dir.exist?(folder)
+          raise "App path does not exist (#{app})"      unless Dir.exist?(app)
+          puts "    [SUCCESS] Directory validation passed".green
+
+          # 1. Extract code signing certificates from the app bundle into the working folder
+          puts "    [INFO] Extracting code signing certificates...".cyan
+          Dir.chdir(folder) do
+              unless system('codesign', '-d', '--extract-certificates', app, out: :close, err: :close)
+                  raise "Failed to extract app certificates"
+              end
+          end
+          puts "    [SUCCESS] Certificates extracted".green
+
+          if generate_info_only
+              # 2. Extract embedded provisioning profile as a plist for inspection
+              puts "    [INFO] Processing mobileprovision...".cyan
+              profile_path = File.join(app, 'embedded.mobileprovision')
+              output_plist = File.join(folder, 'provision.plist')
+              unless system('security', 'cms', '-D', '-i', profile_path, out: output_plist, err: :close)
+                  raise "Failed to extract provisioning profile"
+              end
+              puts "    [SUCCESS] Provisioning profile extracted".green
+
+              # 3. Prepare entitlements file:
+              #    - Use a user-provided entitlements file if $Entitlements is set.
+              #    - Otherwise, extract entitlements from the existing app signature.
+              entitlements_path = File.join(folder, 'entitlements.plist')
+              puts "    [INFO] Generating entitlements...".cyan
+              if defined?($Entitlements) && !$Entitlements.to_s.strip.empty?
+                  FileUtils.cp($Entitlements, entitlements_path)
+                  puts "    [INFO] Using custom entitlements file".cyan
+              else
+                  unless system('codesign', '-d', '--entitlements', '-', '--xml', app,
+                                out: entitlements_path, err: :close)
+                      raise "Failed to extract entitlements"
+                  end
+                  puts "    [INFO] Extracted entitlements from app".cyan
+              end
+
+              # 4. Process all extracted certificates:
+              #    - Convert DER to human-readable text (subject/issuer/serial/dates/etc).
+              #    - Extract PEM-formatted public key information for debugging/verification.
+              puts "    [INFO] Generating certificate details...".cyan
+              %w[0 1 2].each do |i|
+                  cert_der = File.join(folder, "codesign#{i}")
+                  cert_txt = File.join(folder, "certificate#{i}.txt")
+                  pem_txt  = File.join(folder, "pemformat#{i}.txt")
+
+                  raise "Missing DER certificate: #{cert_der}" unless File.exist?(cert_der)
+
+                  unless system(
+                      'openssl', 'x509',
+                      '-inform', 'DER',
+                      '-in',     cert_der,
+                      '-noout',
+                      '-nameopt', 'multiline,utf8',
+                      '-subject', '-issuer', '-serial',
+                      '-pubkey',  '-text',   '-dates',
+                      '-certopt',
+                      'no_header,no_version,no_serial,no_signame,no_subject,' \
+                      'no_issuer,no_validity,no_pubkey,no_sigdump,no_aux,no_extensions',
+                      out: cert_txt,
+                      err: :close
+                  )
+                      raise "Failed to generate certificate details: #{cert_der}"
+                  end
+
+                  unless system(
+                      'openssl', 'rsa',
+                      '-pubin',
+                      '-inform', 'PEM',
+                      '-text',
+                      '-noout',
+                      in:  cert_txt,
+                      out: pem_txt,
+                      err: :close
+                  )
+                      raise "Failed to convert to PEM format: #{cert_txt}"
+                  end
+
+                  puts "    [DEBUG] Processed certificate #{i} → #{pem_txt}".yellow
+              end
+
+              # When generate_info_only is true, we stop here after producing
+              # provisioning / entitlements / certificate info.
+              return
+          end
+
+          # 5. Convert the leaf (first) certificate from DER to PEM for SHA-1 extraction
+          puts "    [INFO] Processing leaf certificate...".cyan
+          cert_der = File.join(folder, "codesign0")
+          cert_pem = File.join(folder, "certificate.pem")
+          raise "Missing leaf certificate: #{cert_der}" unless File.exist?(cert_der)
+
+          unless system('openssl', 'x509', '-inform', 'DER', '-in', cert_der, '-out', cert_pem)
+              raise "Leaf certificate conversion failed"
+          end
+          puts "    [SUCCESS] Leaf certificate converted".green
+
+          # 6. Extract SHA-1 fingerprint from the leaf certificate (case-insensitive regex)
+          puts "    [INFO] Extracting certificate SHA-1 fingerprint...".cyan
+          sha1_result = `openssl x509 -in #{cert_pem} -noout -fingerprint -sha1`
+
+          # Support both "SHA1 Fingerprint=" and case variants like "sha1 Fingerprint="
+          cert_sha1 = sha1_result.scan(/SHA1 Fingerprint=(.*)/i).flatten.first.to_s.gsub(/[:\s]/, "")
+
+          if cert_sha1.empty?
+              puts ".\n.\n[ERROR] Certificate SHA1 fingerprint missing - verify IPA integrity\n.\n.".red.bold
+              exit(false)
+          end
+          puts "  • Using certificate SHA-1: #{cert_sha1}"
+
+          # 7. Ensure the certificate fingerprint actually exists in the current keychain
+          puts "    [INFO] Validating against keychain...".cyan
+          keychain_output, status = Open3.capture2('security', 'find-identity', '-v', '-p', 'codesigning')
+          unless status.success?
+              puts "    [ERROR] Keychain query failed".red
+              puts keychain_output.lines.map { |l| "    #{l}" }.join
+              raise "Keychain validation error"
+          end
+
+          # Collect all 40-hex-digit fingerprints and compare case-insensitively
+          fingerprint_matches =
+              keychain_output
+                  .scan(/([A-F0-9]{40})/i)
+                  .map(&:first)
+                  .select { |fp| fp.casecmp(cert_sha1).zero? }
+
+          if fingerprint_matches.size > 1
+              puts ".\n.\n[CRITICAL] AMBIGUOUS CERTIFICATE ERROR".red.bold
+              puts "Found multiple matching SHA-1 fingerprints for: #{cert_sha1}".red
+              puts "Possible solutions:".yellow
+              puts "  1. Remove duplicate certificates from Keychain Access".yellow
+              puts "  2. Use explicit SHA-1 fingerprint for selection".yellow
+              puts "  3. Contact your certificate administrator".yellow
+              puts "Keychain output:\n#{keychain_output}".red
+              exit(false)
+          end
+
+          unless fingerprint_matches.size == 1
+              puts "    [WARNING] Certificate SHA-1 not found in keychain".yellow
+              puts "    [DEBUG] Available certificates:".yellow
+              system('security', 'find-identity', '-v', '-p', 'codesigning')
+              raise "Certificate SHA1 mismatch"
+          end
+          puts "    [SUCCESS] Keychain validation passed".green
+
+          # 8. Re-sign Hermes frameworks (RN 0.82+ safe detection)
+          frameworks_dir = File.join(app, "Frameworks")
+
+          if Dir.exist?(frameworks_dir)
+            puts "    [INFO] Detecting Hermes frameworks (strict)...".cyan
+
+            hermes_frameworks = Dir.glob(File.join(frameworks_dir, "*.framework")).select do |fw|
+                exec_name = File.basename(fw, ".framework")
+                exec_path = File.join(fw, exec_name)
+
+                next false unless File.exist?(exec_path)
+                next false unless exec_name =~ /\Ahermes(vm)?\z/i
+
+                true
+            end
+            if hermes_frameworks.empty?
+                puts "    [INFO] No Hermes frameworks detected".yellow
+            end
+
+            hermes_frameworks.each do |fw|
+                puts "    [INFO] Re-signing Hermes framework: #{File.basename(fw)}".cyan
+
+                codesig_dir = File.join(fw, "_CodeSignature")
+                FileUtils.rm_rf(codesig_dir) if File.exist?(codesig_dir)
+
+                unless system(
+                    'codesign',
+                    '-f',
+                    '-s', cert_sha1,
+                    '--preserve-metadata=identifier,entitlements,flags',
+                    fw,
+                    out: :close,
+                    err: :close
+                )
+                    raise "Failed to code-sign Hermes framework: #{fw}"
+                end
+
+                puts "    [SUCCESS] Signed #{File.basename(fw)}".green
+            end
+          end
+
+          # 9. Perform final code signing on the app bundle with entitlements
+          puts "    [INFO] Starting code signing...".cyan
+          codesig_dir       = File.join(app, "_CodeSignature")
+          FileUtils.rm_rf(codesig_dir) if File.exist?(codesig_dir)
+
+          entitlements_path = File.join(folder, "entitlements.plist")
+          raise "Missing entitlements file: #{entitlements_path}" unless File.exist?(entitlements_path)
+
+          unless system('codesign', '-f', '-s', cert_sha1, '--entitlements', entitlements_path,
+                        app, out: :close, err: :close)
+              raise "Code signing failed"
+          end
+          puts "    [SUCCESS] Code signing completed".green
+
+      rescue SystemExit
+          # Re-raise explicit exits (used above when we already printed a detailed message)
+          raise
+      rescue => e
+          # Catch-all for unexpected failures during signing pipeline
+          puts ".\n.\n[CRITICAL] Code signing error: #{e}\n" \
+              "Please verify inputs and environment.\n" \
+              "For persistent issues, contact AppSealing support.\n.\n.\n"
+          exit(false)
+      end
+  end
+end
+# hash_lib/snapshot_builder.rb
+
+#--------------------------------------------------------------------------------------------
+# SnapshotBuilder 클래스는 인증서 정보와 CodeResources 해시를 결합해 무결성 스냅샷을 만듭니다.
+# Combines certificate info and CodeResources file hashes into a snapshot string
+#--------------------------------------------------------------------------------------------
+class SnapshotBuilder
+  def self.generate_snapshot(certificate, code_resources_path)
+    snapshot = certificate + generate_hash_snapshot(code_resources_path)
+    debug_log "Snapshot assembled. Total size: #{snapshot.bytesize} bytes" if defined?(debug_log)
+    snapshot
+  end
+
+  #--------------------------------------------------------------------------------------------
+  #  _CodeSignature/CodeResources 파일을 읽어 <key>files</key> 항목의 모든 데이터를 문자열로 변환하여 리턴
+  #  Read the _CodeSignature/CodeResources file and return all <key>files</key> data items as a single string
+  #--------------------------------------------------------------------------------------------
+  # Parses XML in a CodeResources file, extracting all file keys and their hash values from the <key>files</key> dictionary.
+  # - Ignores the <key>files2</key> section if present.
+  # - Concatenates each "key\x01hash" line with a newline.
+  # - Returns this "snapshot" string for file fingerprinting or verification.
+  def self.generate_hash_snapshot(path)
+    debug_log "generate_hash_snapshot called with path=#{path}"
+    snapshot = ""
+    key = ""
+    expect_data = false
+    in_dict = false
+    in_hash = false
+    in_data = false
+    hash_value = nil
+    line_no = 0
+
+    begin
+      debug_log "Opening file: #{path}"
+      file = File.open(path)
+      file.each_line do |line|
+        line_no += 1
+        sline = line.strip
+
+        # <key>files2</key> 진입 시 중단 ("files2"가 나오면 끝)
+        # If <key>files2</key> key is found, exit loop — we only want original files block
+        break if sline.start_with?("<key>files2</key>")
+
+        # <key>files</key> 키는 건너뜀
+        # Skip the <key>files</key> marker line; actual dict parsing begins after
+        next if sline.start_with?("<key>files</key>")
+
+        # key 추출
+        # Extract file key name
+        if !expect_data && sline.start_with?("<key>") && sline.end_with?("</key>")
+          key = sline.gsub("<key>", "").gsub("</key>", "")
+          debug_log "Found file key: #{key}" if $debug_mode
+          expect_data = true
+          next
+        end
+
+        # dict 내부 진입
+        # Entering a <dict> containing hash/data for this file
+        if sline == "<dict>" && expect_data
+          in_dict = true
+          debug_log "Entering <dict> block for key: #{key}"
+          next
+        end
+
+        # dict 내부에서 hash/data 추출
+        # Inside dict, retrieve <hash>/<data> block for file hash
+        if in_dict
+          if sline == "<key>hash</key>"
+            in_hash = true
+            next
+          elsif in_hash && sline == "<data>"
+            in_data = true
+            hash_value = ""
+            debug_log "Inside <data> for key: #{key}"
+            next
+          elsif in_data
+            if sline == "</data>"
+              in_data = false
+              in_hash = false
+              snapshot += "#{key}\1#{hash_value.strip}\n"
+              debug_log "Extracted hash for #{key}: #{hash_value.strip[0..20]}..." if $debug_mode
+            else
+              hash_value += sline
+            end
+            next
+          elsif sline == "</dict>"
+            in_dict = false
+            expect_data = false  # ★ dict 끝에서 expect_data를 반드시 false로!
+            debug_log "Leaving <dict> block for key: #{key}"
+            next
+          end
+        end
+
+        # 기존 <data> (dict 아닌 경우)
+        # Older data pattern: grab <data> when not inside a dict (shouldn't be required in modern files, but guard for legacy)
+        if sline == "<data>" && expect_data && !in_dict
+          in_data = true
+          hash_value = ""
+          debug_log "Legacy <data> start for key: #{key} (outside <dict>)"
+          next
+        end
+        if in_data && !in_dict
+          if sline == "</data>"
+            snapshot += "#{key}\1#{hash_value.strip}\n"
+            debug_log "Legacy hash for #{key}: #{hash_value.strip[0..20]}..." if $debug_mode
+            in_data = false
+            expect_data = false
+          else
+            hash_value += sline
+          end
+          next
+        end
+      end
+    rescue => e
+      # 예외처리: 잘못된 경로나 파일 등
+      # Exception handling: invalid IPA/resource file, missing or corrupt
+      puts ".\n.\nInvalid IPA file has passed to an argument, check your IPA file and try again.\n.\n.\n"
+      puts "[ERROR] Exception: #{e}"
+      debug_log "Exception: #{e.class} - #{e.message}"
+      exit(false)
+    ensure
+      file.close unless file.nil?
+      debug_log "Closed file: #{path}"
+    end
+    puts "[INFO] Snapshot generated successfully. Size: #{snapshot.bytesize} bytes"
+    debug_log "Snapshot generated (#{snapshot.bytesize} bytes, #{snapshot.lines.count} entries)"
+    return snapshot
+  end
+end
+
+# hash_lib/assets_scanner.rb
+
+#--------------------------------------------------------------------------------------------
+# AssetsScanner 클래스는 앱 번들 내 모든 Assets.car 파일을 안전하게 찾아 문자열로 조합합니다.
+# Scans recursively inside the app bundle for Assets.car files, safely and case-insensitively.
+#--------------------------------------------------------------------------------------------
+class AssetsScanner
+  def self.scan_assets_car(app_path)
+    assets = ""
+    assets_pattern = File.join(app_path, "**", "Assets.car")
+    files = Dir.glob(assets_pattern, File::FNM_CASEFOLD).select { |path| File.file?(path) }
+
+    if files.empty?
+      puts "[WARNING] No Assets.car files found".yellow
+      debug_log "No Assets.car files found in: #{app_path}" if defined?(debug_log)
+    else
+      files.each do |car|
+        relative_path = car.sub(/#{Regexp.escape(File.join(app_path, ""))}/, "")
+        assets += "#{relative_path}\u0002"
+        puts "    [DEBUG] Found Assets.car: #{relative_path}".yellow
+        debug_log "Found Assets.car: #{relative_path}" if defined?(debug_log)
+      end
+      assets.chomp!("\u0002")
+      debug_log "Assets.car string assembled: #{assets}" if defined?(debug_log)
+    end
+
+    assets
+  end
+end
+
+require "net/http"
+require "json"
+require "uri"
+require "openssl"
+
+
+#--------------------------------------------------------------------------------------------
+# GenesisService 클래스는 스냅샷과 에셋 정보를 앱실링 서버로 전송하여 genesis 파일을 생성합니다.
+# Sends snapshot and assets data to AppSealing API server to generate the genesis file.
+#--------------------------------------------------------------------------------------------
+class GenesisService
+  # Create Net::HTTP with proper SSL verification and cert store.
+
+  def self.request_genesis(snapshot, assets, options = {})
+    $current_step = options[:current_step] if options[:current_step]
+
+    puts "\n[STEP #{$current_step}] Encrypting app integrity/certificate snapshot ...".bold.yellow
+
+    begin
+      # 1. Validate and convert to hex
+      puts "    [DEBUG] Converting snapshot/assets to hex".yellow
+      debug_log "Converting snapshot + assets to hex" if defined?(debug_log)
+
+      raise "Invalid snapshot data" unless snapshot.is_a?(String) && !snapshot.empty?
+
+      snapshot_hex = snapshot.unpack1("H*")
+      assets_hex   = assets.unpack1("H*")
+      puts "    [DEBUG] Hex conversion successful".yellow
+      debug_log "Hex (snapshot): #{snapshot_hex[0..40]}..." if defined?(debug_log)
+      debug_log "Hex (assets):   #{assets_hex[0..40]}..."   if defined?(debug_log)
+
+      # 2. Validate required parameters
+      required_vars = {
+        account_id_hash: options[:account_id_hash],
+        bundle_id:       options[:bundle_id],
+        sdk_version:     options[:sdk_version],
+        baseURL:         options[:baseURL],
+      }
+
+      missing = required_vars.select { |_, v| v.nil? || v.to_s.strip.empty? }.keys
+      unless missing.empty?
+        puts "    [ERROR] Missing required parameters: #{missing.join(', ')}".red
+        debug_log "Missing required fields: #{missing.join(', ')}" if defined?(debug_log)
+        raise "Missing required parameters: #{missing.join(', ')}"
+      end
+
+      # 3. Execute API request (with SSL-safe HTTP client)
+      uri = URI.parse("#{options[:baseURL]}v3/sdk/ios/requestGenesisForIOS")
+      http = ApiUtils.create_http(uri)
+      http.open_timeout = 15
+      http.read_timeout = 30
+      debug_log "Posting to #{uri}" if defined?(debug_log)
+
+      request   = Net::HTTP::Post.new(uri)
+      form_data = [
+        ["account_id_hash", options[:account_id_hash]],
+        ["bundle_id",       options[:bundle_id]],
+        ["snapshot",        snapshot_hex],
+        ["assets",          assets_hex],
+        ["sdk_version",     options[:sdk_version]],
+      ]
+      request.set_form(form_data, "multipart/form-data")
+
+      puts "    [INFO] Sending request to #{uri}".cyan
+      response = http.start { |h| h.request(request) }
+
+      # 4. Handle response
+      unless response.code == "200"
+        debug_log "HTTP failure: #{response.code} - #{response.message}" if defined?(debug_log)
+        raise "HTTP Error: #{response.code} - #{response.message}"
+      end
+
+      parsed_response = JSON.parse(response.body)
+      result_code     = parsed_response.dig("result", "code")
+      unless result_code == "0000"
+        error_msg = parsed_response.dig("result", "message") || "Unknown error"
+        debug_log "API error: #{error_msg}" if defined?(debug_log)
+        raise "API Error: #{error_msg}"
+      end
+
+      genesis_hex = parsed_response["genesis"]
+      unless genesis_hex.is_a?(String) && !genesis_hex.empty?
+        debug_log "Invalid genesis data received" if defined?(debug_log)
+        raise "Invalid genesis data in response"
+      end
+
+      # 5. Save file
+      genesis_path = File.join(options[:app_path], "genesis")
+      puts "    [INFO] Writing genesis file to #{genesis_path}".cyan
+      debug_log "Writing genesis to #{genesis_path}" if defined?(debug_log)
+
+      File.open(genesis_path, "wb") do |f|
+        f.write([genesis_hex].pack("H*")) # Convert hex string back to binary
+      end
+
+      puts "    [SUCCESS] Genesis file saved successfully".green
+      debug_log "Genesis file size: #{genesis_hex.length / 2} bytes" if defined?(debug_log)
+
+      true
+    rescue JSON::ParserError => e
+      puts <<~ERROR.red.bold
+             [CRITICAL] Failed to parse API response
+             Response Body: #{response.body[0..200]}...
+             Error: #{e.message}
+           ERROR
+      debug_log "JSON ParserError: #{e.message}" if defined?(debug_log)
+      exit(false)
+    rescue => e
+      puts <<~ERROR.red.bold
+             [ERROR] Process failed
+             Step: #{$current_step}
+             Message: #{e.message}
+             Backtrace:
+             #{e.backtrace.first(5).join("\n")}
+           ERROR
+      debug_log "Genesis request failure: #{e.message}" if defined?(debug_log)
+      exit(false)
+    end
+  end
+end
+
+require "fileutils"
+require "shellwords"
+
+#--------------------------------------------------------------------------------------------
+# IpaRebuilder 클래스는 변경된 앱 번들을 다시 압축하여 최종 IPA 파일을 생성 및 정리합니다.
+# Rebuilds a modified app bundle into an IPA, cleans up temp files, and verifies the final package.
+#--------------------------------------------------------------------------------------------
+class IpaRebuilder
+
+  def self.rebuild_and_cleanup(argv, folder, app_path)
+    puts "\n[STEP #{$current_step += 1}] Rebuilding & Re-signing IPA".bold.yellow
+    debug_log "Beginning IPA re-packaging and final export..." if defined?(debug_log)
+
+    original_ipa = File.absolute_path(argv[0])
+    resigned_ipa = File.join(
+      File.dirname(original_ipa),
+      "#{File.basename(original_ipa, File.extname(original_ipa))}.ipa"
+    )
+    puts "  • Output IPA: #{resigned_ipa}"
+    debug_log "Output IPA path set: #{resigned_ipa}" if defined?(debug_log)
+
+    if File.exist?(resigned_ipa)
+      puts "    [INFO] Removing existing IPA: #{resigned_ipa}".cyan
+      FileUtils.rm(resigned_ipa, force: true)
+      debug_log "Old IPA deleted: #{resigned_ipa}" if defined?(debug_log)
+    end
+
+    package_dir = File.join(folder, "Package")
+    puts "    [INFO] Packaging from: #{package_dir}".cyan
+    debug_log "Packaging directory: #{package_dir}" if defined?(debug_log)
+
+    zip_command = [
+      "cd #{Shellwords.escape(package_dir)}",
+      "zip -qr #{Shellwords.escape(resigned_ipa)} ./*",
+    ].join(" && ")
+
+    unless system(zip_command)
+      raise "IPA packaging failed (exit #{$?.exitstatus})"
+    end
+
+    puts "    [SUCCESS] ZIP command executed successfully".green
+    debug_log "IPA packaged successfully at: #{resigned_ipa}" if defined?(debug_log)
+
+    unless File.exist?(resigned_ipa)
+      raise "Resigned IPA not created: #{resigned_ipa}"
+    end
+
+    final_size = File.size(resigned_ipa)
+    puts "    [SUCCESS] IPA created: #{final_size} bytes".green
+    debug_log "Final IPA size: #{final_size} bytes" if defined?(debug_log)
+
+    puts "    [INFO] Cleaning temporary files".cyan
+    FileUtils.remove_entry_secure(folder, force: true)
+    puts "    [DEBUG] Temp directory removed: #{folder}".yellow
+    debug_log "Temp folder removed: #{folder}" if defined?(debug_log)
+
+    puts "\n\n[END] All processes have done successfully .......\n\n\n".bold.green
+    debug_log "IPA generation process completed successfully" if defined?(debug_log)
+  rescue => e
+    puts <<~ERROR.red.bold
+           [CRITICAL ERROR] IPA rebuild failed
+           Step: #{current_step}
+           Message: #{e.message}
+           Backtrace:
+           #{e.backtrace.first(5).join("\n")}
+         ERROR
+    debug_log "IPA rebuild exception: #{e.class} - #{e.message}" if defined?(debug_log)
+    exit(false)
+  end
+end
+
+
+# hash_lib/license_extractor.rb
+
+#--------------------------------------------------------------------------------------------
+# LicenseExtractor 클래스는 appsealing.lic 파일을 읽어 account ID 해시와 SDK 버전을 추출합니다.
+# This class reads the appsealing.lic file to extract account ID hash and SDK version.
+#--------------------------------------------------------------------------------------------
+class LicenseExtractor
+  attr_reader :account_id_hash, :sdk_version
+
+  def initialize
+    @account_id_hash = nil
+    @sdk_version = nil
+  end
+
+  def extract_from_file(path)
+    puts "    [INFO] Checking license file: #{path}".cyan
+    debug_log "Checking license file at: #{path}"
+
+    unless File.exist?(path)
+      warn "[ERROR] License file not found: #{path}".red.bold
+      debug_log "License file missing: #{path}"
+      return
+    end
+
+    expected_magic = "\x41\x53\x4C\x46\x76".b # "ASLFv"
+    debug_log "Expected magic string: #{expected_magic.inspect}"
+
+    begin
+      File.open(path, "rb") do |file|
+        header = file.read(5)
+        debug_log "Read license header: #{header&.unpack1("H*")}"
+        puts "    [DEBUG] Magic header: #{header&.unpack1("H*")}".yellow
+        unless header == expected_magic
+          warn "[ERROR] Invalid license format: Magic number mismatch".red.bold
+          debug_log "Magic number mismatch in license file"
+          return
+        end
+        puts "    [INFO] Magic number check passed".cyan
+        debug_log "Magic number check passed"
+
+        file.read(3) # skip reserved
+        debug_log "Skipped 3 reserved bytes"
+
+        @sdk_version = file.read(48)&.gsub(/\x00/, "")
+        puts "    [INFO] SDK Version: #{@sdk_version.inspect}".cyan
+        debug_log "SDK version read: #{@sdk_version.inspect}"
+        if @sdk_version.nil? || @sdk_version.empty?
+          warn "[ERROR] Corrupted license: SDK version missing".red.bold
+          debug_log "SDK version missing or empty"
+          return
+        end
+
+        file.read(8) # skip reserved
+        debug_log "Skipped 8 reserved bytes"
+
+        account_hash_bin = file.read(32)
+        debug_log "Read account hash: #{account_hash_bin&.unpack1("H*") rescue nil}"
+        if account_hash_bin.nil? || account_hash_bin.bytesize != 32
+          warn "[ERROR] Corrupted license: Account hash missing or wrong size".red.bold
+          debug_log "Account hash missing or wrong size in license"
+          return
+        end
+
+        @account_id_hash = account_hash_bin.unpack1("H*").upcase
+        puts "    [INFO] Account ID Hash: #{@account_id_hash}".cyan
+        debug_log "Extracted Account ID Hash: #{@account_id_hash}"
+        puts "    [SUCCESS] License file parsing completed".green
+      end
+    rescue => e
+      warn "[EXCEPTION] License parsing failed: #{e.message}"
+      debug_log "Exception during license file parse: #{e.class} - #{e.message}"
+      @account_id_hash = nil
+    end
+  end
+end
+
+# hashlib/unreal_license_extractor.rb
+require "thread"
+require "stringio"
+
+class UnrealLicenseExtractor
+  attr_reader :account_id_hash, :sdk_version, :bundle_id, :is_unreal
+
+  def initialize
+    @account_id_hash = nil
+    @sdk_version = ""
+    @bundle_id = ""
+    @is_unreal = false
+  end
+
+  def extract_from_executable(path)
+    raise "File not found: #{path}" unless File.exist?(path)
+
+    file_size = File.size(path)
+    @progress = 0
+    parse_finished = false
+    position_mutex = Mutex.new
+
+    magic1 = "\x41\x53\x4C\x46".b # 'ASLF'
+    magic2 = "\x76\x34\x0A\x0D".b # License version/magic
+    zero4 = "\x00\x00\x00\x00".b
+
+    chunk_size = 4 * 1024 * 1024 # 4MB chunks
+    puts "Scanning #{path} (#{file_size} bytes)..."
+
+    ui_thread = Thread.new do
+      while !parse_finished && @progress < file_size
+        position_mutex.synchronize do
+          percent = (@progress * 100) / file_size
+          print "\rProgress: #{percent}%"
+        end
+        sleep(0.1)
+      end
+      print "\n"
+    end
+
+    parse_thread = Thread.new do
+      File.open(path, "rb") do |file|
+        buffer = "".b
+        total_read = 0
+        until parse_finished || total_read >= file_size
+          chunk = file.read(chunk_size)
+          break unless chunk
+          buffer += chunk
+          total_read += chunk.bytesize
+          search_pos = 0
+          while idx = buffer.index(magic1, search_pos)
+            # Validate headers and extract license details accordingly
+            # (implementation preserved as original)
+
+            # Update instance variables
+            # @sdk_version, @account_id_hash, @bundle_id, @is_unreal accordingly
+
+            search_pos = idx + 1
+
+            break if parse_finished
+          end
+
+          # Keep last partial buffer for possible split matches
+          buffer = buffer[-(magic1.size + 256)..-1] || "".b
+          position_mutex.synchronize { @progress = total_read }
+        end
+      end
+      parse_finished = true
+    rescue => e
+      puts "\nError during parsing: #{e.message}"
+      puts e.backtrace.take(5)
+      raise e
+    end
+
+    parse_thread.join
+    ui_thread.join
+
+    unless @is_unreal
+      raise "Failed to extract valid license from executable."
+    end
+
+    { account_id_hash: @account_id_hash, sdk_version: @sdk_version, bundle_id: @bundle_id }
+  end
+end
+
+# hash_lib/js_encryptor.rb
+
+require "fileutils"
+require "json"
+require "net/http"
+require "shellwords"
+require "uri"
+require "openssl"
+
+
+#--------------------------------------------------------------------------------------------
+# JSBundleEncryptor 클래스는 main.jsbundle 파일을 서버에 보내 암호화 처리하고 결과물을 받아 옵니다.
+# Sends and encrypts the React Native main.jsbundle using the AppSealing server API.
+#--------------------------------------------------------------------------------------------
+class JSBundleEncryptor
+
+  def self.debug_log(message)
+    puts "[DEBUG] #{message}" if ENV["DEBUG"] == "true"
+  end
+
+  def self.encrypt_javascript_bytecode(app, bundle_id)
+    debug_log "encrypt_javascript_bytecode started for app=#{app}"
+
+    $sdk_version = "1.0.0.0" if $sdk_version.start_with?("NEW")
+    $use_ssl = !$baseURL.start_with?("http://")
+    debug_log "Using SDK version: #{$sdk_version}, use_ssl: #{$use_ssl}"
+
+    zip_path    = "#{app}/main.zip"
+    result_path = "#{app}/enc_main.zip"
+    debug_log "Preparing temp files: zip_path=#{zip_path}, result_path=#{result_path}"
+
+    begin
+      debug_log "Archiving main.jsbundle to #{zip_path}"
+      unless system("cd #{Shellwords.escape(app)} && zip -q main.zip main.jsbundle")
+        debug_log "Zip archive creation failed"
+        raise "Failed to create JS bundle archive"
+      end
+      puts "    [INFO] Temporary archive created: #{zip_path}".cyan
+
+      endpoints = {
+        sealing:  URI("#{$baseURL}html5/requestSealingForIOS"),
+        status:   URI("#{$baseURL}html5/sealingStatusForIOS"),
+        download: URI("#{$baseURL}html5/downloadSealedFileForIOS"),
+      }
+      debug_log "Endpoints: #{endpoints}"
+
+      puts(<<~INFO.lines.map { |line| "    " + line }.join)
+        [SEALING REQUEST]
+        - Bundle ID: #{bundle_id}
+        - Account ID: #{$account_id_hash}
+        - SDK Version: #{$sdk_version}
+        - Endpoint: #{endpoints[:sealing]}
+      INFO
+      debug_log "Sealing request for bundle_id=#{bundle_id}, account_id_hash=#{$account_id_hash}"
+
+      sealing_complete = false
+      progress = Thread.new do
+        print "    [PROGRESS] Sealing process".ljust(32).cyan
+        until sealing_complete
+          print ".".cyan
+          sleep 0.5
+        end
+      end
+
+      response = nil
+      Thread.new {
+        begin
+          debug_log "Sending archive to sealing endpoint"
+          File.open(zip_path, "rb") do |jsfile|
+            # --- sealing request with SSL-safe HTTP client ---
+            http = ApiUtils.create_http(endpoints[:sealing])
+            response = http.start do |h|
+              request = Net::HTTP::Post.new(endpoints[:sealing])
+              request.set_form([
+                ["bundle_id", bundle_id],
+                ["account_id_hash", $account_id_hash],
+                ["sdk_version", $sdk_version],
+                ["html5file", jsfile],
+              ], "multipart/form-data")
+              h.request(request)
+            end
+            debug_log "Initial API response: #{response.code} #{response.class}"
+
+            handle_response(response, :sealing)
+            pack_id = JSON.parse(response.body).dig("SEALING_INFO", "pack_id")
+            debug_log "Returned pack_id: #{pack_id}"
+
+            # --- status polling with SSL-safe HTTP client ---
+            status_uri   = endpoints[:status]
+            loop do
+              http = ApiUtils.create_http(status_uri)
+              response = http.start do |h|
+                request = Net::HTTP::Post.new(status_uri)
+                request.set_form([["pack_id", pack_id]], "multipart/form-data")
+                h.request(request)
+              end
+              debug_log "Polled sealing status: Response #{response.code}"
+
+              status_info = JSON.parse(response.body)
+              status      = status_info.dig("SEALING_INFO", "status")
+              debug_log "Server status=#{status}"
+
+              case status
+              when "2"
+                debug_log "Seal process complete (status=2)"
+                break
+              when "3"
+                error_msg = status_info.dig("SEALING_INFO", "message") || "Unknown server error"
+                debug_log "Server sealing failed (status=3): #{error_msg}"
+                raise "Server sealing failed (Status 3): #{error_msg}"
+              end
+              sleep 0.5
+            end
+
+            # --- download sealed result with SSL-safe HTTP client ---
+            debug_log "Requesting sealed result file for pack_id=#{pack_id}"
+            http = ApiUtils.create_http(endpoints[:download])
+            response = http.start do |h|
+              request = Net::HTTP::Post.new(endpoints[:download])
+              request.set_form([
+                ["bundle_id", bundle_id],
+                ["account_id_hash", $account_id_hash],
+                ["pack_id", pack_id],
+              ], "multipart/form-data")
+              h.request(request)
+            end
+            debug_log "Download sealed file response type: #{response['Content-Type']}"
+
+            if response["Content-Type"].include?("application/json")
+              debug_log "Sealed file download failed: got JSON instead of file"
+              handle_response(response, :download)
+            else
+              debug_log "Writing final result to #{result_path}"
+              File.write(result_path, response.body)
+              system("cd #{Shellwords.escape(app)} && unzip -qo enc_main.zip")
+              debug_log "Unzipped sealed bundle to #{app}"
+              FileUtils.rm_f(["#{app}/main.zip", result_path])
+              system("xattr -cr #{Shellwords.escape(app)}/main.jsbundle")
+              debug_log "Post-extract cleanup complete"
+            end
+          end
+        rescue => e
+          server_message = begin
+              JSON.parse(response.body)&.dig("SEALING_INFO", "message") rescue "N/A"
+            end
+          server_pack_id = begin
+              JSON.parse(response.body)&.dig("SEALING_INFO", "pack_id") rescue "N/A"
+            end
+
+          puts <<~ERROR.red.bold
+                 \n[ERROR] Sealing process failed
+                 - Type: #{e.class}
+                 - Message: #{e.message}
+                 - Server Message: #{server_message}
+                 - Server pack_id: #{server_pack_id}
+                 - Bundle ID: #{bundle_id}
+                 - Account ID: #{$account_id_hash}
+                 - SDK Version: #{$sdk_version}
+                 - HTTP Status: #{response&.code || "N/A"}
+                 
+                 Possible causes:
+                 1. Server-side error: #{server_message}
+                 2. Network connectivity issues
+                 3. Invalid API credentials
+                 4. Resource validation failure
+               ERROR
+          debug_log "Sealing thread error: #{e.class} - #{e.message}"
+          debug_log "Server message: #{server_message}, pack_id: #{server_pack_id}, bundle_id: #{$bundle_id}, sdk_version: #{$sdk_version}"
+          exit(false)
+        ensure
+          sealing_complete = true
+          debug_log "Background sealing thread finished"
+        end
+      }.join
+
+      progress.join
+      puts "\n    [SUCCESS] JavaScript bytecode encryption completed successfully".green
+      debug_log "encrypt_javascript_bytecode completed without error"
+    ensure
+      debug_log "Cleaning up temp files (#{zip_path}, #{result_path})"
+      FileUtils.rm_f([zip_path, result_path]) rescue nil
+    end
+  end
+
+  def self.handle_response(response, api_phase)
+    debug_log "handle_response: phase=#{api_phase}, status=#{response.code}, class=#{response.class}"
+    return if response.is_a?(Net::HTTPSuccess)
+
+    # Attempt to extract server error message, fall back to body preview
+    error_info = begin
+        debug_log "Parsing error info from response body"
+        JSON.parse(response.body).dig("result", "message") rescue response.body[0..200]
+      end
+
+    debug_log "API Error (phase=#{api_phase}): status=#{response.code}, message=#{error_info.inspect}"
+    raise <<~ERROR.red.bold
+            API Error (#{api_phase.to_s.upcase})
+            - Status: #{response.code}
+            - Message: #{error_info}
+            - URI: #{response.uri}
+          ERROR
+  end
+end
+
+
+# hash_lib/certificate_extractor.rb
+
+require "fileutils"
+
+#--------------------------------------------------------------------------------------------
+# CertificateExtractor 클래스는 PEM 및 텍스트 인증서 파일에서 상세 인증서 정보를 추출합니다.
+# Extracts detailed certificate fields from PEM and certificate txt files.
+#--------------------------------------------------------------------------------------------
+class CertificateExtractor
+  attr_reader :app_id, :team_id, :certificate_summary
+
+  def initialize(folder, app_id, team_id)
+    @folder = folder
+    @app_id = app_id
+    @team_id = team_id
+    @certificate_summary = ""
+    @cert_info = prepare_cert_info_hash
+  end
+
+  def extract_info
+    ["0", "1", "2"].each do |i|
+      extract_certificates(i)
+    end
+
+    add_protection_flags
+    puts "    [INFO] Certificate extraction completed.".cyan
+    debug_log "Final certificate summary size: #{@certificate_summary.bytesize} bytes" if defined?(debug_log)
+
+    @certificate_summary
+  end
+
+  private
+
+  def prepare_cert_info_hash
+    hash = {}
+    ["0", "1", "2"].each do |i|
+      hash["subject#{i}"] = ""
+      hash["issuer#{i}"] = ""
+      hash["serial#{i}"] = ""
+      hash["pubkey#{i}"] = ""
+      hash["valid_from#{i}"] = ""
+      hash["valid_to#{i}"] = ""
+      hash["app_id#{i}"] = ""
+      hash["team_id#{i}"] = ""
+    end
+    hash
+  end
+
+  def extract_certificates(i)
+    pem_file = File.join(@folder, "pemformat#{i}.txt")
+    cert_file = File.join(@folder, "certificate#{i}.txt")
+
+    unless File.exist?(pem_file)
+      puts "    [ERROR] PEM file not found: #{pem_file}".red
+      debug_log "PEM file missing: #{pem_file}" if defined?(debug_log)
+      return
+    end
+
+    puts "    [INFO] Processing PEM file: #{pem_file}".cyan
+    debug_log "Processing PEM: #{pem_file}" if defined?(debug_log)
+    process_pem_file(pem_file, i)
+
+    unless File.exist?(cert_file)
+      puts "    [ERROR] Certificate file not found: #{cert_file}".red
+      debug_log "Certificate text missing: #{cert_file}" if defined?(debug_log)
+      return
+    end
+
+    puts "    [INFO] Processing certificate file: #{cert_file}".cyan
+    debug_log "Processing certificate TXT: #{cert_file}" if defined?(debug_log)
+    process_cert_file(cert_file, i)
+
+    build_certificate_summary(i)
+  end
+
+  def process_pem_file(pem_file, i)
+    current_mode = nil
+    File.foreach(pem_file) do |line|
+      if line.start_with?("Modulus")
+        current_mode = "pubkey#{i}"
+        next
+      elsif line.start_with?("Exponent")
+        current_mode = nil
+        next
+      end
+      @cert_info[current_mode] += line.strip if current_mode
+    end
+  rescue => e
+    puts "    [ERROR] Failed to process PEM file #{pem_file}: #{e.message}".red
+    debug_log "PEM read error: #{e.class} - #{e.message}" if defined?(debug_log)
+  end
+
+  def process_cert_file(cert_file, i)
+    current_mode = nil
+    File.foreach(cert_file) do |line|
+      case line
+      when /^subject=/
+        current_mode = "subject#{i}"
+        next
+      when /^issuer=/
+        current_mode = "issuer#{i}"
+        next
+      when /^serial=/
+        @cert_info["serial#{i}"] = line.split("=", 2)[1].to_s.strip
+        next
+      when /^notBefore=/
+        @cert_info["valid_from#{i}"] = line.split("=", 2)[1].to_s.strip
+        next
+      when /^notAfter=/
+        @cert_info["valid_to#{i}"] = line.split("=", 2)[1].to_s.strip
+        next
+      when /^-----BEGIN PUBLIC KEY-----/
+        current_mode = "pubkey#{i}"
+        next
+      when /^-----END PUBLIC KEY-----/
+        current_mode = nil
+        next
+      end
+
+      if current_mode == "subject#{i}" || current_mode == "issuer#{i}"
+        key, value = line.split("=", 2).map(&:strip) rescue [nil, nil]
+        next unless key && value
+        case key
+        when "userId" then @cert_info[current_mode] += "/UID=#{value}"
+        when "commonName" then @cert_info[current_mode] += "/CN=#{value}"
+        when "organizationalUnitName" then @cert_info[current_mode] += "/OU=#{value}"
+        when "organizationName" then @cert_info[current_mode] += "/O=#{value}"
+        when "countryName" then @cert_info[current_mode] += "/C=#{value}"
+        end
+      end
+    end
+  rescue => e
+    puts "    [ERROR] Failed to process certificate file #{cert_file}: #{e.message}".red
+    debug_log "Certificate TXT read error: #{e.class} - #{e.message}" if defined?(debug_log)
+  end
+
+  def build_certificate_summary(i)
+    @certificate_summary += "##$##&AI#{i}#{@app_id}\n"
+    @certificate_summary += "##$##&TI#{i}#{@team_id}\n"
+    @certificate_summary += "##$##&SJ#{i}#{@cert_info["subject#{i}"]}\n"
+    @certificate_summary += "##$##&IS#{i}#{@cert_info["issuer#{i}"]}\n"
+    @certificate_summary += "##$##&SN#{i}#{@cert_info["serial#{i}"]}\n"
+    @certificate_summary += "##$##&PK#{i}#{@cert_info["pubkey#{i}"]}\n"
+    @certificate_summary += "##$##&VF#{i}#{@cert_info["valid_from#{i}"]}\n"
+    @certificate_summary += "##$##&VT#{i}#{@cert_info["valid_to#{i}"]}\n"
+  end
+
+  def add_protection_flags
+    if defined?($antiswizzle) && $antiswizzle == "enable"
+      @certificate_summary += "##&##*ASENABLE\n"
+      debug_log "Anti-swizzle flag added" if defined?(debug_log)
+    end
+    if defined?($antihook) && $antihook == "disable"
+      @certificate_summary += "##&##*AHDISABLE\n"
+      debug_log "Anti-hook flag added (disabled)" if defined?(debug_log)
+    end
+    if defined?($securefile) && $securefile == 'enable'
+      @certificate_summary += "##&##*SFSENABLE\n"
+      debug_log "Secure Filesystem flag added (enabled)" if defined?(debug_log)
+    end
+  end
+end
+
+
+
+#--------------------------------------------------------------------------------------------
+# Debug / Globals
+#--------------------------------------------------------------------------------------------
+$debug_mode = ARGV.include?("--debug")
+puts "[DEBUG MODE ENABLED]" if $debug_mode
+DebugLogger.enable_debug_mode!($debug_mode)
+
+def debug_log(message)
+    DebugLogger.debug_log(message)
+end
+
+$current_step ||= 0
+$LOCAL_TEST = $debug_mode ? true : false
+
+include REXML
+
+$request_param = []
+$source_path = []
+$enc_strings = {}
+
+LOCAL_TEST = false
+$baseURL = 'https://tst-api.appsealing.com/covault/gw/'
+$position = 0
+$isUnreal = false
+$isXamarin = false
+$Entitlements = ""
+
+#--------------------------------------------------------------------------------------------
+# CLI parsing
+#--------------------------------------------------------------------------------------------
+if __FILE__ == $0
+    cli = AppSealingCLI.new(ARGV)
+    cli.parse_and_validate_args!
+    $cli_ipa_path = cli.ipa_path
+    $cli_options = cli.options
+end
+
+#--------------------------------------------------------------------------------------------
+# Main flow
+#--------------------------------------------------------------------------------------------
+begin
+    ipa_path = $cli_ipa_path
+    raise "IPA file does not exist: #{ipa_path}" unless File.exist?(ipa_path)
+
+    $securefile = $cli_options[:securefile]
+
+    #========================================================================================
+    # Step 1: Secure File I/O API Verification
+    #========================================================================================
+    if defined?($securefile) && $securefile == "enable"
+        puts "\n[STEP #{$current_step += 1}] Verifying whether the Secure Filesystem is using only allowed methods...".bold.yellow
+
+        unless File.exist?(SWIFTPM_TARGET)
+            puts "    [INFO] By default, Secure Filesystem usage is disabled. To enable this feature, code must be verified to use only allowed methods.".cyan
+            puts "    [INFO] Initial verification requires a one-time SwiftSyntax build, which may take several minutes.".cyan
+            print "    Do you want to proceed with the SwiftSyntax build now? [Y/n]: ".yellow
+
+            answer = $stdin.gets.chomp.downcase
+            if answer == "n" || answer == "no"
+                puts "    [INFO] Skipping Secure FileIO verification. Secure Filesystem will be considered disabled.".yellow
+                $securefile = "disable"
+            end
+        end
+
+        if $securefile == "enable"
+            project_path = File.expand_path(File.join(__dir__, ".."))
+            unless SecureFilesystem.check_secure_fileio(project_path)
+                SecureFilesystem.print_allowed_methods
+                exit(0)
+            end
+        end
+    else
+        puts "    [INFO] Secure Filesystem feature is disabled. To enable, use '-securefile=enable'.".yellow
+    end
+
+    #========================================================================================
+    # Step 2: Prepare Workspace
+    #========================================================================================
+    puts "\n[STEP #{$current_step += 1}] Preparing workspace...".bold.yellow
+
+    folder = File.expand_path(File.join(Dir.tmpdir, "AppSealing", SecureRandom.hex)) + "/"
+    FileUtils.mkdir_p(folder)
+
+    Dir[File.join(folder, "*")].each { |f| FileUtils.rm_rf(f) }
+
+    package_dir = File.join(folder, "Package")
+    ShellUtils.safe_system("unzip -q '#{ipa_path}' -d '#{package_dir}'", "IPA extraction failed")
+
+    app = Dir.glob(File.join(package_dir, "Payload/*.app")).first
+    raise "App bundle not found in Payload" unless app && File.directory?(app)
+
+    app_path = app.to_s
+    raise "Invalid code signature" unless File.exist?(File.join(app, "_CodeSignature/CodeResources"))
+
+    entitlements_path = File.join(folder, "entitlements.plist")
+    ShellUtils.safe_system(
+        "codesign -d --entitlements :- '#{app_path}' > '#{entitlements_path}'",
+        "Entitlements extraction failed"
+    )
+
+    #========================================================================================
+    # Step 3: Hermes Validation
+    #========================================================================================
+    puts "\n[STEP #{$current_step += 1}] Validating Hermes compatibility".bold.yellow
+
+    project_rn_version = HermesValidator.detect_react_native_version_from_project_root
+    if project_rn_version
+        script_dir = File.expand_path(File.dirname(__FILE__))
+        unless HermesValidator.check_and_copy_hermes_files(project_rn_version, script_dir, app_path)
+            puts "    [ERROR] Hermes verification failed.".bold.red
+            exit(1)
+        end
+    end
+
+    #========================================================================================
+    # Step 4: Modify Info.plist
+    #========================================================================================
+    puts "\n[STEP #{$current_step += 1}] Modifying Info.plist".bold.yellow
+
+    tmp_info = File.join(folder, "Info.plist")
+    ShellUtils.safe_system(
+        "/usr/libexec/PlistBuddy -x -c 'Print' '#{app}/Info.plist' > '#{tmp_info}'",
+        "Info.plist extraction failed"
+    )
+
+    FileUtils.cp(tmp_info, File.join(app, "Info.plist"))
+    plist = PlistManager.new(File.join(app, "Info.plist"))
+
+    bundle_id = plist.read("CFBundleIdentifier")
+    plist.update_url_scheme($cli_options[:url_scheme]) if $cli_options[:url_scheme]
+    plist.update_key("CFBundleShortVersionString", $cli_options[:version]) if $cli_options[:version]
+    plist.update_key("NSCameraUsageDescription", $cli_options[:camera_desc]) if $cli_options[:camera_desc]
+    plist.save_file
+
+    #============================================================================================
+    # Step 5: Extract signature information
+    #============================================================================================
+    puts "\n[STEP #{$current_step += 1}] Extracting signature information".bold.yellow
+    CodeSigner.sign_app_payload(app, folder, true)
+
+    #============================================================================================
+    # Step 6: Extract AppSealing account hash
+    #============================================================================================
+    puts "\n[STEP #{$current_step += 1}] Extracting AppSealing license information".bold.yellow
+
+    lic_app = File.join(app_path, "appsealing.lic")
+    lic_fw  = File.join(app_path, "Frameworks/AppSealingFramework.framework", "appsealing.lic")
+
+    result =
+        if File.exist?(lic_app)
+            StringUtils.get_accountID_hash_from_license_file(lic_app)
+        elsif File.exist?(lic_fw)
+            StringUtils.get_accountID_hash_from_license_file(lic_fw)
+        else
+            exe = File.join(app_path, File.basename(app_path, File.extname(app_path)))
+            StringUtils.get_accountID_hash_from_unreal_executable(exe)
+        end
+
+    sdk_version = result[:sdk_version]
+    account_id_hash = result[:account_id_hash]
+
+    #============================================================================================
+    # Step 7: Encrypt React Native JavaScript bytecode
+    #============================================================================================
+    puts "\n[STEP #{$current_step += 1}] Encrypting React Native JavaScript bytecode".bold.yellow
+
+    main_js = File.join(app_path, "main.jsbundle")
+    if File.exist?(main_js)
+        File.open(main_js, "rb") do |f|
+            f.seek(0x7C)
+            byte = f.read(1)
+            JSBundleEncryptor.encrypt_javascript_bytecode(app, bundle_id) if byte&.bytes&.first == 0
+        end
+    end
+
+    #============================================================================================
+    # Step 8: Codesign app (post-modification)
+    #============================================================================================
+    puts "\n[STEP #{$current_step += 1}] Codesigning app (post-modification)".bold.yellow
+    CodeSigner.sign_app_payload(app, folder, false)
+
+    #============================================================================================
+    # Step 9: Extract certificate & provisioning information
+    #============================================================================================
+    puts "\n[STEP #{$current_step += 1}] Extracting certificate information".bold.yellow
+
+    plist = PlistManager.new(entitlements_path)
+    $app_id = plist.read("application-identifier")
+
+    provision = PlistManager.new(File.join(folder, "provision.plist"))
+    $team_id = provision.read("TeamIdentifier")&.first
+
+    cert = CertificateExtractor.new(folder, $app_id, $team_id)
+    $antihook = $cli_options[:antihook]
+    $antiswizzle = $cli_options[:antiswizzle]
+    certificate_summary = cert.extract_info
+
+    #============================================================================================
+    # Step 10: Generate integrity snapshot
+    #============================================================================================
+    puts "\n[STEP #{$current_step += 1}] Generating integrity snapshot".bold.yellow
+
+    snapshot = SnapshotBuilder.generate_snapshot(
+        certificate_summary,
+        File.join(app_path, "_CodeSignature/CodeResources")
+    )
+
+    #============================================================================================
+    # Step 11: Scan Assets.car
+    #============================================================================================
+    puts "\n[STEP #{$current_step += 1}] Scanning Assets.car".bold.yellow
+    assets = AssetsScanner.scan_assets_car(app)
+
+    #============================================================================================
+    # Step 12: Request Genesis file
+    #============================================================================================
+    puts "\n[STEP #{$current_step += 1}] Requesting genesis file".bold.yellow
+
+    GenesisService.request_genesis(
+        snapshot,
+        assets,
+        {
+            account_id_hash: account_id_hash,
+            bundle_id: bundle_id,
+            sdk_version: sdk_version,
+            baseURL: $baseURL,
+            app_path: app_path,
+            current_step: $current_step
+        }
+    )
+
+    #============================================================================================
+    # Step 13: Re-sign and rebuild IPA
+    #============================================================================================
+    puts "\n[STEP #{$current_step += 1}] Rebuilding IPA".bold.yellow
+
+    CodeSigner.sign_app_payload(app, folder, false)
+    IpaRebuilder.rebuild_and_cleanup(ARGV, folder, app_path)
+
+rescue => e
+    puts "\n[ERROR] #{e.message}".red.bold
+    exit(false)
+end

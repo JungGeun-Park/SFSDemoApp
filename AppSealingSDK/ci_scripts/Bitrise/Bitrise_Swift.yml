@@ -1,0 +1,111 @@
+format_version: '13'
+default_step_lib_source: https://github.com/bitrise-io/bitrise-steplib.git
+project_type: ios
+workflows:
+  archive_and_export_app:
+    summary: Create an IPA file to install your app on a device or share it with your
+      team.
+    description: The workflow will first clone your Git repository, cache and install
+      your project's dependencies if any, export an IPA file from the project and
+      save it.
+    steps:
+    - git-clone@8: {}
+    - script@1:
+        title: Create Keychain
+        inputs:
+          - content: |-
+              #!/bin/bash
+              set -ex
+              security delete-keychain login.keychain-db
+              security create-keychain -p "$BITRISE_KEYCHAIN_PASSWORD" login.keychain-db
+              security default-keychain -s login.keychain-db
+              security unlock-keychain -p "$BITRISE_KEYCHAIN_PASSWORD" login.keychain-db
+              security set-keychain-settings -t 3600 -l login.keychain-db
+    - certificate-and-profile-installer@1:
+        inputs:
+          - certificate_url: "file://./distribution.p12"
+          - certificate_passphrase: "$CERTIFICATE_PASSWORD"
+          - provisioning_profile_url: "file://./profile.mobileprovision"
+          - keychain_path: "$HOME/Library/Keychains/login.keychain-db"
+          - keychain_password: "$BITRISE_KEYCHAIN_PASSWORD"
+          - team_id: "$BITRISE_TEAM_ID"
+    - script@1:
+        title: Set Project Path and Scheme
+        inputs:
+          - content: |-
+              #!/bin/bash
+              set -ex
+              
+              # Find .xcodeproj file
+              PROJECT_PATH=$(find . -name "*.xcodeproj" -type d | head -n 1)
+              if [ -z "$PROJECT_PATH" ]; then
+                echo "Error: No Xcode project found"
+                exit 1
+              fi
+              
+              # Get scheme name
+              SCHEME=$(xcodebuild -project "$PROJECT_PATH" -list | grep -A 1 "Schemes:" | tail -n 1 | xargs)
+              if [ -z "$SCHEME" ]; then
+                echo "Error: No scheme found"
+                exit 1
+              fi
+              
+              # Export variables
+              envman add --key BITRISE_PROJECT_PATH --value "$PROJECT_PATH"
+              envman add --key BITRISE_SCHEME --value "$SCHEME"
+              
+              echo "Project Path: $PROJECT_PATH"
+              echo "Scheme: $SCHEME"    
+    - script@1:
+        title: Set Build Number
+        inputs:
+          - content: |-
+              #!/bin/bash
+              set -ex
+              cd $BITRISE_SOURCE_DIR
+              agvtool new-version -all $BITRISE_BUILD_NUMBER
+    - xcode-archive@5:
+        inputs:
+          - project_path: "$BITRISE_PROJECT_PATH"
+          - scheme: "$BITRISE_SCHEME"
+          - distribution_method: app-store
+          - automatic_code_signing: api-key
+          - certificate_url_list: "file://./distribution.p12"
+          - passphrase_list: "$CERTIFICATE_PASSWORD"
+          - cache_level: none
+          - destination: "generic/platform=iOS"
+    - script@1:
+        title: Extract Bundle ID
+        inputs:
+          - content: |-
+              #!/bin/bash
+              set -ex
+              BUNDLE_ID=$(xcodebuild -showBuildSettings -project "$BITRISE_PROJECT_PATH" -target "$BITRISE_SCHEME" | grep PRODUCT_BUNDLE_IDENTIFIER | awk -F ' = ' '{print $2}' | tail -n 1)
+              envman add --key BITRISE_APP_BUNDLE_ID --value "$BUNDLE_ID"
+    - script@1:
+        title: Run Generate Hash
+        inputs:
+          - content: |-
+              #!/bin/bash
+              set -ex
+              cd "$BITRISE_SOURCE_DIR"
+              chmod +x ./AppSealingSDK/Tools/generate_hash
+              ./AppSealingSDK/Tools/generate_hash "$BITRISE_IPA_PATH"
+    - deploy-to-itunesconnect-deliver@2:
+        inputs:
+          - ipa_path: "$BITRISE_IPA_PATH"
+          - bundle_id: "$BITRISE_APP_BUNDLE_ID"
+    - deploy-to-bitrise-io@2: {}    
+    triggers:
+      push:
+      - branch: main
+      pull_request:
+      - source_branch: "*"
+meta:
+  bitrise.io:
+    stack: osx-xcode-16.0.x
+    machine_type_id: g2-m1.4core
+app:
+  envs:
+  - BITRISE_KEYCHAIN_PASSWORD: anything
+  - CERTIFICATE_PASSWORD: $BITRISE_CERTIFICATE_PASSWORD

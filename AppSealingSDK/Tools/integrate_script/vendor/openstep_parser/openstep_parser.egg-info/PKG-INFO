@@ -1,0 +1,10 @@
+Metadata-Version: 1.0
+Name: openstep-parser
+Version: 1.5.1
+Summary: OpenStep plist reader into python objects
+Home-page: http://github.com/kronenthaler/openstep-parser
+Author: Ignacio Calderon
+Author-email: UNKNOWN
+License: BSD License
+Description: UNKNOWN
+Platform: UNKNOWN

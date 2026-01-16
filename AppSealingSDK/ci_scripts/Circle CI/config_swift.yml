@@ -1,0 +1,177 @@
+version: 2.1
+
+executors:
+  mac:
+    macos:
+      xcode: 16.0.0
+    working_directory: /Users/distiller/project
+
+jobs:
+  build-and-upload:
+    executor: mac
+    environment:
+      KEYCHAIN_NAME: "circle.keychain"
+      KEYCHAIN_PASSWORD: "circle"
+      PROVISIONING_PROFILE_FILE: "profile.mobileprovision"
+      HASH_SCRIPT_PATH: "*/AppSealingSDK/*"
+    steps:
+      - checkout
+
+      - run:
+          name: Extract Workspace and Scheme
+          command: |
+            if ls *.xcworkspace 1> /dev/null 2>&1; then
+              WORKSPACE_NAME=$(ls | grep xcworkspace | head -n 1)
+              echo "export WORKSPACE_NAME=$WORKSPACE_NAME" >> $BASH_ENV
+              SCHEME_NAME=$(xcodebuild -workspace "$WORKSPACE_NAME" -list | grep -A 1 "Schemes:" | tail -n 1 | xargs)
+            else
+              PROJECT_NAME=$(ls | grep xcodeproj | head -n 1)
+              echo "export PROJECT_NAME=$PROJECT_NAME" >> $BASH_ENV
+              SCHEME_NAME=$(xcodebuild -project "$PROJECT_NAME" -list | grep -A 1 "Schemes:" | tail -n 1 | xargs)
+            fi
+            echo "export SCHEME_NAME=$SCHEME_NAME" >> $BASH_ENV
+
+            echo "PROJECT_NAME = ${PROJECT_NAME}"
+            echo "WORKSPACE_NAME = ${WORKSPACE_NAME}"
+            echo "SCHEME_NAME = ${SCHEME_NAME}"
+
+            if [ ! -z "$WORKSPACE_NAME" ]; then
+              BUNDLE_ID=$(xcodebuild -workspace "$WORKSPACE_NAME" -scheme "$SCHEME_NAME" -showBuildSettings | grep "^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER" | sed 's/.*= //')
+            else
+              BUNDLE_ID=$(xcodebuild -project "$PROJECT_NAME" -scheme "$SCHEME_NAME" -showBuildSettings | grep "^[[:space:]]*PRODUCT_BUNDLE_IDENTIFIER" | sed 's/.*= //')
+            fi
+
+            if [ -z "$BUNDLE_ID" ]; then
+              echo "❌ ERROR: Failed to extract BUNDLE_ID"
+              exit 1
+            fi
+            
+            echo "BUNDLE_ID=\"$BUNDLE_ID\"" >> $BASH_ENV
+            echo "Bundle ID = ${BUNDLE_ID}"
+            source $BASH_ENV
+
+      - run:
+          name: Set up Keychain
+          command: |
+            security create-keychain -p $KEYCHAIN_PASSWORD $KEYCHAIN_NAME
+            security default-keychain -s $KEYCHAIN_NAME
+            security unlock-keychain -p $KEYCHAIN_PASSWORD $KEYCHAIN_NAME
+            security set-keychain-settings -t 3600 -l ~/Library/Keychains/$KEYCHAIN_NAME
+      
+      - run:
+          name: Install Certificate
+          command: |
+            security import ./distribution.p12 -k ~/Library/Keychains/$KEYCHAIN_NAME -P $CERTIFICATE_PASSWORD -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k $KEYCHAIN_PASSWORD $KEYCHAIN_NAME
+      
+      - run:
+          name: Install Provisioning Profile
+          command: |
+            mkdir -p ~/Library/Developer/Xcode/UserData/Provisioning\ Profiles/
+            cp ./$PROVISIONING_PROFILE_FILE ~/Library/Developer/Xcode/UserData/Provisioning\ Profiles/
+      
+      - run:
+          name: Generate exportOptions.plist
+          command: |
+            cat > ./exportOptions.plist \<< EOL
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+                <key>method</key>
+                <string>app-store</string>
+                <key>teamID</key>
+                <string>${TEAM_ID}</string>
+                <key>signingStyle</key>
+                <string>manual</string>
+                <key>stripSwiftSymbols</key>
+                <true/>
+                <key>uploadBitcode</key>
+                <false/>
+                <key>uploadSymbols</key>
+                <true/>
+                <key>provisioningProfiles</key>
+                <dict>
+                    <key>${BUNDLE_ID}</key>
+                    <string>${YOUR_PROVISIONING_PROFILE_NAME}</string>
+                </dict>                
+            </dict>
+            </plist>
+            EOL
+            cat ./exportOptions.plist
+
+      - run:
+          name: Auto-increment Build Number
+          command: |
+            if [ ! -z "$WORKSPACE_NAME" ]; then
+              cd $(dirname "$WORKSPACE_NAME")
+            else
+              cd $(dirname "$PROJECT_NAME")
+            fi
+            
+            xcrun agvtool new-version -all $CIRCLE_BUILD_NUM
+
+      - run:
+          name: Build Project
+          command: |
+            if [ ! -z "$WORKSPACE_NAME" ]; then
+              xcodebuild \
+                -workspace "$WORKSPACE_NAME" \
+                -scheme "$SCHEME_NAME" \
+                -configuration Release \
+                -destination 'generic/platform=iOS' \
+                -allowProvisioningUpdates \
+                -archivePath "${SCHEME_NAME}.xcarchive" \
+                archive
+            else
+              xcodebuild \
+                -project "$PROJECT_NAME" \
+                -scheme "$SCHEME_NAME" \
+                -configuration Release \
+                -destination 'generic/platform=iOS' \
+                -allowProvisioningUpdates \
+                -archivePath "${SCHEME_NAME}.xcarchive" \
+                archive
+            fi
+
+      - run:
+          name: Export IPA
+          command: |
+            xcodebuild \
+              -exportArchive \
+              -archivePath "${SCHEME_NAME}.xcarchive" \
+              -exportOptionsPlist ./exportOptions.plist \
+              -exportPath ./artifacts
+
+      - run:
+          name: Generate Security Hash
+          command: |
+            HASH_SCRIPT=$(find . -name "generate_hash" -path "$HASH_SCRIPT_PATH")
+            
+            if [ -z "$HASH_SCRIPT" ]; then
+              echo "❌ ERROR: generate_hash script not found in specified path"
+              exit 1
+            fi
+            
+            chmod +x "$HASH_SCRIPT"
+            "$HASH_SCRIPT" "./artifacts/${SCHEME_NAME}.ipa"
+                        
+      - run:
+          name: Upload to App Store Connect
+          command: |
+            xcrun altool --upload-app \
+              --type ios \
+              --file "./artifacts/${SCHEME_NAME}.ipa" \
+              --username "$APPLE_ID" \
+              --password "$APP_SPECIFIC_PASSWORD" \
+              --verbose
+
+workflows:
+  version: 2
+  build-test-deploy:
+    jobs:
+      - build-and-upload:
+          filters:
+            branches:
+              only:
+                - main

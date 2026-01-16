@@ -1,0 +1,224 @@
+#=============================================================================================================================================================
+#
+#
+# Azure Script code for Flutter project
+#
+#
+#=============================================================================================================================================================
+trigger:
+- develop   # Change to your branch name
+
+pool:
+  name: APPSEALING  # Change to your agent name
+
+steps:
+  - script: |
+      # Check if Flutter is installed, if not, install it
+      if ! command -v flutter &> /dev/null
+      then
+          echo "Flutter is not installed. Installing Flutter..."
+
+          # Install dependencies
+          brew install --cask flutter
+
+          # Verify installation
+          flutter --version
+      else
+          echo "Flutter is already installed."
+      fi
+
+      # Define paths
+      P12_CERT_PATH="$(Build.SourcesDirectory)/ios/distribution.p12"
+      PROVISIONING_PROFILE_PATH="$(Build.SourcesDirectory)/ios/profile.mobileprovision"
+      KEYCHAIN_PATH="$HOME/Library/Keychains/temp-keychain.keychain-db"
+      KEYCHAIN_PASSWORD="temp123"
+
+      if security list-keychains | grep -q "temp-keychain.keychain-db"; then
+          echo "Deleting existing temporary keychain..."
+          security delete-keychain "$KEYCHAIN_PATH"
+      fi
+
+      echo "Creating temporary keychain..."
+      security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+      echo "Setting temporary keychain as default..."
+      security list-keychains -d user -s "$KEYCHAIN_PATH"
+      security default-keychain -s "$KEYCHAIN_PATH"
+      security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+      security set-keychain-settings -lut 3600 "$KEYCHAIN_PATH"
+
+      echo "Importing distribution certificate (PKCS#12) into temporary keychain..."
+      security import "$P12_CERT_PATH" -k "$KEYCHAIN_PATH" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+      security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+      security find-identity -v "$KEYCHAIN_PATH"
+    displayName: 'Setup Temporary Keychain and Install Certificate'
+    env:
+      CERTIFICATE_PASSWORD: $(CERTIFICATE_PASSWORD)
+
+  - script: |
+      # Check iOS settings in Flutter project
+      SCHEME_NAME=$(flutter doctor -v | grep -A 1 "iOS toolchain" | tail -n 1 | awk '{print $1}')
+      APP_NAME="Runner"
+      echo "##vso[task.setvariable variable=SCHEME_NAME]$SCHEME_NAME"
+      echo "##vso[task.setvariable variable=APP_NAME]$APP_NAME"
+      echo "##vso[task.logissue type=warning] Extracted SCHEME_NAME: $SCHEME_NAME"
+      echo "##vso[task.logissue type=warning] Extracted APP_NAME: $APP_NAME"
+    displayName: 'Extract Scheme and App Name'
+
+  - script: |
+      # Increment build number in Flutter project
+      cd "$(Build.SourcesDirectory)"
+      flutter pub get
+
+      # Fetch the current build number
+      CURRENT_BUILD_NUMBER=$(agvtool what-version -terse)
+      NEW_BUILD_NUMBER=$((CURRENT_BUILD_NUMBER + 1))
+
+      # Set the new build number using agvtool
+      agvtool next-version -all
+      NEW_BUILD_NUMBER=$(agvtool what-version -terse)
+      echo "##vso[task.setvariable variable=BUILD_NUMBER]$NEW_BUILD_NUMBER"
+      echo "##vso[task.logissue type=warning] New Build Number: $NEW_BUILD_NUMBER"
+    displayName: 'Increment Build Number'
+
+  - script: |
+      INFO_PLIST_PATH="$(Build.SourcesDirectory)/ios/Runner/Info.plist"
+
+      # 1. Try to extract directly from Info.plist
+      if [ -f "$INFO_PLIST_PATH" ]; then
+          echo "Extracting CFBundleIdentifier from Info.plist..."
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$INFO_PLIST_PATH" 2>/dev/null)
+
+          # If variable is not confirmed, extract from Xcode build settings
+          if [[ "$BUNDLE_ID" == *"$"* ]]; then
+              echo "Variable detected. Searching for PRODUCT_BUNDLE_IDENTIFIER in Xcode build settings..."
+              BUNDLE_ID=$(xcodebuild -showBuildSettings \
+                          -project "$(Build.SourcesDirectory)/ios/Runner.xcodeproj" \
+                          -scheme Runner \
+                          -configuration Release \
+                          -sdk iphoneos |
+                          grep -E '^\s*PRODUCT_BUNDLE_IDENTIFIER\s*=' |
+                          awk -F '=' '{print $2}' |
+                          sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+          fi
+      else
+          # 2. If Info.plist does not exist, extract directly from Xcode build settings
+          echo "Info.plist does not exist. Extracting from Xcode build settings..."
+          BUNDLE_ID=$(xcodebuild -showBuildSettings \
+                      -project "$(Build.SourcesDirectory)/ios/Runner.xcodeproj" \
+                      -scheme Runner \
+                      -configuration Release \
+                      -sdk iphoneos |
+                      grep -E '^\s*PRODUCT_BUNDLE_IDENTIFIER\s*=' |
+                      awk -F '=' '{print $2}' |
+                      sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      fi
+
+      # Final validation
+      if [ -z "$BUNDLE_ID" ]; then
+          echo "##vso[task.logissue type=error] Bundle identifier not found!"
+          exit 1
+      fi
+
+      echo "Final BUNDLE_ID: $BUNDLE_ID"
+      echo "##vso[task.setvariable variable=BUNDLE_ID]$BUNDLE_ID"
+      echo "##vso[task.logissue type=warning] Extracted Bundle ID: $BUNDLE_ID"
+
+      # Create ExportOptions.plist after extracting the Bundle ID
+      EXPORT_DIR="$(Build.ArtifactStagingDirectory)"  # Use absolute path
+      mkdir -p "$EXPORT_DIR"
+
+      cat << EOF > "$EXPORT_DIR/ExportOptions.plist"
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>method</key>
+            <string>app-store</string>
+            <key>teamID</key>
+            <string>$TEAM_ID</string>
+            <key>provisioningProfiles</key>
+            <dict>
+                <key>$BUNDLE_ID</key>
+                <string>$PROVISIONING_PROFILE_NAME</string>
+            </dict>
+        </dict>
+        </plist>
+        EOF
+
+      echo "ExportOptions.plist created with provisioningProfiles and bundle ID."
+      cat "$EXPORT_DIR/ExportOptions.plist"  # Output the created plist content for debugging
+    displayName: 'Extract Bundle ID and Create ExportOptions.plist'
+    env:
+      TEAM_ID: $(TEAM_ID)
+      PROVISIONING_PROFILE_NAME: $(PROVISIONING_PROFILE_NAME)
+
+  - script: |
+      # Define paths for Flutter iOS build
+      EXPORT_DIR="$(Build.ArtifactStagingDirectory)"
+      IPA_PATH="$EXPORT_DIR/$(APP_NAME).ipa"
+      ARCHIVE_PATH="$EXPORT_DIR/$(APP_NAME).xcarchive"
+      WORKSPACE_PATH="$(Build.SourcesDirectory)/ios/Runner.xcworkspace"
+
+      # Ensure minimum deployment target is set
+      /usr/libexec/PlistBuddy -c "Set :IPHONEOS_DEPLOYMENT_TARGET 12.0" "$(Build.SourcesDirectory)/ios/Runner/Info.plist"
+
+      # Build iOS Flutter app
+      flutter build ios --release --no-codesign
+
+      # Create .xcarchive
+      xcodebuild -workspace "$WORKSPACE_PATH" \
+                 -scheme 'Runner' \
+                 -sdk iphoneos \
+                 -configuration 'Release' \
+                 clean archive \
+                 CODE_SIGN_IDENTITY="Apple Distribution" \
+                 CODE_SIGN_STYLE="Manual" \
+                 DEVELOPMENT_TEAM="$TEAM_ID" \
+                 PROVISIONING_PROFILE_SPECIFIER="$PROVISIONING_PROFILE_NAME" \
+                 -archivePath "$ARCHIVE_PATH"
+
+      # Export IPA file
+      xcodebuild -exportArchive \
+        -archivePath "$ARCHIVE_PATH" \
+        -exportOptionsPlist "$EXPORT_DIR/ExportOptions.plist" \
+        -exportPath "$EXPORT_DIR"
+      echo "IPA successfully exported: $IPA_PATH"
+    displayName: 'Build and Export IPA'
+    env:
+      TEAM_ID: $(TEAM_ID)
+      PROVISIONING_PROFILE_NAME: $(PROVISIONING_PROFILE_NAME)
+
+  - script: |
+      # Grant execution permission to generate_hash script
+      HASH_SCRIPT_PATH="$(Build.SourcesDirectory)/ios/AppSealingSDK/Tools/generate_hash"
+      EXPORT_DIR="$(Build.ArtifactStagingDirectory)"
+      IPA_PATH=$(find "$EXPORT_DIR" -type f -name "*.ipa" | head -n 1)
+
+      echo "Granting execution permission to generate_hash..."
+      chmod +x "$HASH_SCRIPT_PATH"
+
+      echo "Running generate_hash with IPA..."
+      "$HASH_SCRIPT_PATH" "$IPA_PATH"
+    displayName: 'Run generate_hash on IPA'
+
+  - script: |
+      EXPORT_DIR="$(Build.ArtifactStagingDirectory)"
+      IPA_PATH=$(find "$EXPORT_DIR" -type f -name "*.ipa" | head -n 1)
+      set -x
+      xcrun altool --upload-app -f "$IPA_PATH" -t ios -u "$APPLE_ID" -p "$APP_SPECIFIC_PASSWORD"
+    displayName: 'Upload to TestFlight'
+    env:
+      APPLE_ID: $(APPLE_ID)
+      APP_SPECIFIC_PASSWORD: $(APP_SPECIFIC_PASSWORD)
+
+  - script: |
+      echo "Deleting temporary keychain..."
+      TEMP_KEYCHAIN_PATH="$HOME/Library/Keychains/temp-keychain.keychain-db"
+      if [ -f "$TEMP_KEYCHAIN_PATH" ]; then
+          # Delete only the temporary keychain, not the default login keychain
+          security delete-keychain "$TEMP_KEYCHAIN_PATH"
+          echo "Temporary keychain deleted successfully."
+      else
+          echo "Temporary keychain not found. Skipping deletion."
+      fi
+    displayName: 'Cleanup Temporary Keychain'
